@@ -21,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: 安装依赖
-        run: pip install requests deep-translator
+        run: pip install requests deep-translator duckduckgo_search
 
       - name: 抓取新闻并发送邮件
         env:
@@ -29,11 +29,10 @@ jobs:
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_SMTP_CODE: ${{ secrets.QQ_SMTP_CODE }}
-          # === 可选 ===
-          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+          # === DDG 无需额外 Key，完全免费 ===
           # === 新闻源开关 ===
           SOURCE_GNEWS: "1"
-          SOURCE_BRAVE: "1"
+          SOURCE_DDG: "1"
           SOURCE_BAIDU: "1"
           SOURCE_HACKERNEWS: "1"
           SOURCE_36KR: "1"

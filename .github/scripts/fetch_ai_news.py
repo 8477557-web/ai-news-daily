@@ -21,6 +21,7 @@ import requests
 import xml.etree.ElementTree as ET
 
 from deep_translator import GoogleTranslator
+from duckduckgo_search import DDGS
 
 # ---------- 邮箱配置 ----------
 QQ_EMAIL = os.environ["QQ_EMAIL"]
@@ -32,7 +33,7 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 # ---------- 新闻源开关 ----------
 SOURCE_SWITCH = {
     "gnews":        os.getenv("SOURCE_GNEWS", "1"),
-    "brave":        os.getenv("SOURCE_BRAVE", "1"),
+    "ddg":          os.getenv("SOURCE_DDG", "1"),
     "baidu":        os.getenv("SOURCE_BAIDU", "1"),
     "hackernews":   os.getenv("SOURCE_HACKERNEWS", "1"),
     "36kr_ai":      os.getenv("SOURCE_36KR", "1"),
@@ -283,46 +284,26 @@ def fetch_gnews() -> list[dict]:
     return results
 
 
-def fetch_brave() -> list[dict]:
-    """Brave Search API — 免费 2000 次/月，搜索 AI 新闻"""
-    api_key = os.getenv("BRAVE_API_KEY", "")
-    if not api_key:
-        print("[SKIP] Brave: 未设置 BRAVE_API_KEY（https://brave.com/search/api/ 免费申请）")
-        return []
-
+def fetch_duckduckgo() -> list[dict]:
+    """DuckDuckGo 新闻搜索 — 完全免费，无需 API Key，无需绑卡"""
     results, seen = [], set()
-    for query in ["AI artificial intelligence latest", "大模型 AI 最新进展", "AI agent news"]:
+    queries = ["AI artificial intelligence", "大模型 AI 人工智能", "AI agent OpenAI"]
+    for query in queries:
         try:
-            resp = requests.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "freshness": "pd", "count": 10, "search_lang": "zh"},
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": api_key,
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            for r in resp.json().get("web", {}).get("results", []):
+            ddgs = DDGS()
+            for r in ddgs.news(query, timelimit="d", max_results=10):
                 url = r.get("url", "")
                 if url and url not in seen:
                     seen.add(url)
-                    # 解析发布时间
-                    pub = ""
-                    extra = r.get("extra_snippets", []) if "extra_snippets" in r else []
-                    for e in extra:
-                        if isinstance(e, str) and ("小时前" in e or "天前" in e or "月" in e):
-                            pub += e + " "
                     results.append({
                         "title": r.get("title", ""),
-                        "description": r.get("description", "") or "",
+                        "description": r.get("body", "") or "",
                         "url": url,
-                        "source": "Brave Search",
-                        "published": pub.strip(),
+                        "source": f"DuckDuckGo·{r.get('source', '')}",
+                        "published": r.get("date", ""),
                     })
         except Exception as e:
-            print(f"[WARN] Brave '{query}': {e}", file=sys.stderr)
+            print(f"[WARN] DuckDuckGo '{query}': {e}", file=sys.stderr)
     return results
 
 
@@ -483,7 +464,7 @@ def fetch_techcrunch_ai() -> list[dict]:
 # ============================================================
 SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
     ("gnews",        fetch_gnews,         "🌍 GNews"),
-    ("brave",       fetch_brave,         "🌍 Brave"),
+    ("ddg",         fetch_duckduckgo,    "🌍 DDG"),
     ("baidu",        fetch_baidu,         "🇨🇳 百度"),
     ("hackernews",   fetch_hackernews,    "🌍 HN"),
     ("36kr_ai",      fetch_36kr_ai,       "🇨🇳 36氪"),
