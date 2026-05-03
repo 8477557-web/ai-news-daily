@@ -15,8 +15,11 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from typing import Callable
 
+import re
 import requests
 import xml.etree.ElementTree as ET
+
+from deep_translator import GoogleTranslator
 
 # ---------- 邮箱配置 ----------
 QQ_EMAIL = os.environ["QQ_EMAIL"]
@@ -271,8 +274,70 @@ SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
 
 
 # ============================================================
-#  聚合、格式化、发送
+#  翻译
 # ============================================================
+
+# 中文字符范围（含 CJK 统一汉字、中文标点）
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿　-〿＀-￯]+")
+
+_translator: GoogleTranslator | None = None
+
+
+def _needs_translation(text: str) -> bool:
+    """文本不含中文则可能需要翻译"""
+    return bool(text) and not bool(_CJK_RE.search(text))
+
+
+def translate_articles(articles: list[dict]) -> list[dict]:
+    """将英文标题和摘要翻译为中文，中文内容保持不变"""
+    global _translator
+    if _translator is None:
+        _translator = GoogleTranslator(source="en", target="zh-CN")
+
+    to_translate: list[tuple[int, str]] = []  # (index, text)
+    texts: list[str] = []
+
+    for i, a in enumerate(articles):
+        title = a.get("title", "")
+        desc = a.get("description", "")
+
+        need_title = _needs_translation(title)
+        need_desc = _needs_translation(desc)
+
+        if need_title:
+            to_translate.append((i, "title"))
+            texts.append(title)
+        if need_desc and desc:
+            to_translate.append((i, "desc"))
+            texts.append(desc[:300])
+
+    if not texts:
+        print("[INFO] 所有内容已是中文，无需翻译")
+        return articles
+
+    print(f"[INFO] 需要翻译 {len(texts)} 段文本...")
+
+    translated: dict[int, str] = {}  # text_index -> translated_text
+    for idx, text in enumerate(texts):
+        try:
+            result = _translator.translate(text)
+            translated[idx] = result
+            if (idx + 1) % 5 == 0:
+                print(f"       翻译进度: {idx + 1}/{len(texts)}")
+        except Exception as e:
+            print(f"[WARN] 翻译失败 (第{idx+1}条): {e}", file=sys.stderr)
+            translated[idx] = text  # 翻译失败保留原文
+
+    for (art_idx, field), (_, text) in zip(to_translate, enumerate(texts)):
+        if text in translated:  # 通过匹配原文找到翻译
+            pass  # translated[enumerate_index] already has the result
+
+    # 实际映射：to_translate 和 texts 的索引是对齐的
+    for trans_idx, (art_idx, field) in enumerate(to_translate):
+        if trans_idx in translated:
+            articles[art_idx][f"{field}_cn"] = translated[trans_idx]
+
+    return articles
 
 def collect_articles() -> list[dict]:
     """遍历所有启用的源，收集并去重"""
@@ -302,17 +367,35 @@ def collect_articles() -> list[dict]:
 
 
 def build_html(articles: list[dict]) -> str:
-    """生成 HTML 邮件"""
+    """生成 HTML 邮件，有翻译则优先显示中文"""
     now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     rows = ""
     for a in articles:
         pub = a["published"].replace("T", " ").replace("Z", "")[:19] if a["published"] else ""
-        desc = a["description"][:200] if a["description"] else ""
+
+        # 标题：有中文翻译就显示中文，英文作为副标题
+        title_cn = a.get("title_cn", "")
+        title_en = a.get("title", "")
+        if title_cn and title_cn != title_en:
+            title_html = f'{title_cn}<br><span style="font-size:13px;color:#888;font-weight:normal">{title_en}</span>'
+        else:
+            title_html = title_en
+
+        # 摘要：优先中文
+        desc_cn = a.get("desc_cn", "")
+        desc_en = a.get("description", "")[:200]
+        if desc_cn and desc_cn != desc_en:
+            desc_html = f'{desc_cn}<br><span style="color:#999;font-size:12px">{desc_en[:150]}</span>'
+        elif desc_en:
+            desc_html = desc_en
+        else:
+            desc_html = ""
+
         rows += f"""
         <tr>
             <td style="padding:12px;border-bottom:1px solid #eee">
-                <a href="{a['url']}" style="color:#1a73e8;text-decoration:none;font-weight:bold">{a['title']}</a>
-                <div style="color:#555;font-size:14px;margin-top:4px">{desc}</div>
+                <a href="{a['url']}" style="color:#1a73e8;text-decoration:none;font-weight:bold">{title_html}</a>
+                <div style="color:#555;font-size:14px;margin-top:4px">{desc_html}</div>
                 <div style="color:#999;font-size:12px;margin-top:4px">
                     {pub} · <strong>{a['source']}</strong>
                 </div>
@@ -365,6 +448,7 @@ def main():
         print("[WARN] 未获取到任何新闻，跳过发送", file=sys.stderr)
         return
 
+    articles = translate_articles(articles)
     html = build_html(articles)
     send_email(html, len(articles))
 
