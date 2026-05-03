@@ -1,21 +1,22 @@
-"""每日 AI 新闻抓取 — 多源聚合 + QQ 邮箱发送
+"""每日 AI 新闻摘要 — 多源聚合 + 中文翻译 + 智能摘要 + QQ 邮箱发送
 
-支持三种类型的新闻源，可自由启用/禁用：
-  1. API 类（需要 key）：GNews
-  2. 免费 API 类（无需 key）：HackerNews
-  3. RSS 类（无需 key，国内+国外）：36氪、机器之心、IT之家、TechCrunch
+新闻源（可开关）：
+  API 类：GNews、Bing Search
+  免费 API：HackerNews
+  RSS 类：36氪、机器之心、IT之家、TechCrunch
+  网页抓取：百度新闻
 
-添加新源：写一个返回 list[dict] 的函数，注册到 SOURCES 列表即可。
+输出：昨日 AI 热点摘要（≤600字）+ 来源链接
 """
 import os
+import re
 import sys
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Callable
 
-import re
 import requests
 import xml.etree.ElementTree as ET
 
@@ -28,36 +29,33 @@ SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# ---------- 新闻源配置 ----------
-# 通过环境变量控制是否启用某个源（"1"=启用，其他=禁用）
-# 默认：GNews + HackerNews + 36氪 启用，其余按需开启
+# ---------- 新闻源开关 ----------
 SOURCE_SWITCH = {
     "gnews":        os.getenv("SOURCE_GNEWS", "1"),
+    "bing":         os.getenv("SOURCE_BING", "1"),
+    "baidu":        os.getenv("SOURCE_BAIDU", "1"),
     "hackernews":   os.getenv("SOURCE_HACKERNEWS", "1"),
     "36kr_ai":      os.getenv("SOURCE_36KR", "1"),
-    "jiqizhixin":    os.getenv("SOURCE_JIQIZHIXIN", "1"),   # 机器之心
-    "ithome":        os.getenv("SOURCE_ITHOME", "1"),       # IT之家
-    "techcrunch_ai": os.getenv("SOURCE_TECHCRUNCH", "1"),  # TechCrunch AI
+    "jiqizhixin":   os.getenv("SOURCE_JIQIZHIXIN", "1"),
+    "ithome":       os.getenv("SOURCE_ITHOME", "1"),
+    "techcrunch_ai": os.getenv("SOURCE_TECHCRUNCH", "1"),
 }
 
+MAX_DIGEST_CHARS = 600
+MAX_SOURCES = 10
 
 # ============================================================
-#  通用工具
+#  通用工具：RSS/Atom 解析、日期处理
 # ============================================================
 
-def _parse_feed(xml_text: str, item_tag: str = "item") -> list[dict]:
-    """解析 RSS 2.0 / Atom feed，兼容命名空间，返回标准化文章列表"""
-    # 去除 XML 声明中的编码声明，避免解析问题
+def _parse_feed(xml_text: str) -> list[dict]:
+    """解析 RSS 2.0 / Atom feed，兼容命名空间"""
     root = ET.fromstring(xml_text)
-
-    # 判断是 Atom 还是 RSS
     tag = root.tag.lower()
     is_atom = "feed" in tag or "atom" in tag
-
     results = []
 
     if is_atom:
-        # Atom 格式: <feed><entry>...</entry></feed>
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         for entry in root.findall("atom:entry", ns) or root.findall("entry"):
             title = _find_text(entry, "title")
@@ -67,55 +65,200 @@ def _parse_feed(xml_text: str, item_tag: str = "item") -> list[dict]:
                 url = link_el.get("href", "")
             desc = _find_text(entry, "summary") or _find_text(entry, "content")
             pub = _find_text(entry, "published") or _find_text(entry, "updated")
-            results.append({
-                "title": title or "",
-                "description": (desc or "")[:200],
-                "url": url or "",
-                "published": pub or "",
-            })
+            results.append({"title": title or "", "description": (desc or "")[:200],
+                            "url": url or "", "published": pub or ""})
     else:
-        # RSS 2.0 格式: <rss><channel><item>...</item></channel></rss>
         for item in root.iter("item"):
-            title = _find_text(item, "title")
-            url = _find_text(item, "link")
-            desc = _find_text(item, "description")
-            pub = _find_text(item, "pubDate")
             results.append({
-                "title": title or "",
-                "description": (desc or "")[:200],
-                "url": url or "",
-                "published": pub or "",
+                "title": _find_text(item, "title") or "",
+                "description": (_find_text(item, "description") or "")[:200],
+                "url": _find_text(item, "link") or "",
+                "published": _find_text(item, "pubDate") or "",
             })
-
     return results
 
 
 def _find_text(element: ET.Element, tag: str) -> str:
     """按本地名查找子元素文本，忽略命名空间"""
     for child in element:
-        # 去掉命名空间前缀，如 {http://...}title → title
         local = child.tag.split("}", 1)[-1] if "}" in child.tag else child.tag
         if local == tag:
             return (child.text or "").strip()
     return ""
 
 
+def _get_yesterday() -> date:
+    """返回北京时间昨天"""
+    return (datetime.now(BEIJING_TZ) - timedelta(days=1)).date()
+
+
+def _parse_date(published_str: str) -> date | None:
+    """尝试解析各种时间格式，返回北京时间日期"""
+    if not published_str:
+        return None
+    s = published_str.strip()
+
+    # ISO 8601: 2026-05-03T12:00:00Z
+    for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d %H:%M:%S"]:
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(BEIJING_TZ).date()
+        except ValueError:
+            continue
+
+    # RFC 2822: Mon, 03 May 2026 12:00:00 +0000 / GMT
+    for fmt in ["%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"]:
+        try:
+            return datetime.strptime(s, fmt).astimezone(BEIJING_TZ).date()
+        except ValueError:
+            continue
+
+    # 百度: "3小时前" / "昨天" / "5月2日"
+    now = datetime.now(BEIJING_TZ)
+    if "小时前" in s:
+        try:
+            hours = int(re.search(r"(\d+)", s).group(1))
+            return (now - timedelta(hours=hours)).date()
+        except (ValueError, AttributeError):
+            pass
+    if "昨天" in s or "昨日" in s:
+        return (now - timedelta(days=1)).date()
+    if "分钟前" in s or "刚刚" in s:
+        return now.date()
+    m = re.match(r"(\d{1,2})月(\d{1,2})日", s)
+    if m:
+        return date(now.year, int(m.group(1)), int(m.group(2)))
+
+    return None
+
+
+def _is_yesterday(published_str: str) -> bool:
+    d = _parse_date(published_str)
+    return d == _get_yesterday() if d else False
+
+
 # ============================================================
-#  新闻源实现 — 每个函数返回 list[dict]
-#  dict 格式: {"title", "description", "url", "source", "published"}
+#  翻译
+# ============================================================
+
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿]+")
+
+_translator: GoogleTranslator | None = None
+
+
+def _has_chinese(text: str) -> bool:
+    return bool(_CJK_RE.search(text))
+
+
+def translate_articles(articles: list[dict]) -> list[dict]:
+    """英文标题/摘要翻译为中文"""
+    global _translator
+    if _translator is None:
+        _translator = GoogleTranslator(source="en", target="zh-CN")
+
+    texts: list[str] = []
+    mappings: list[tuple[int, str]] = []  # (article_index, field)
+
+    for i, a in enumerate(articles):
+        for field in ["title", "description"]:
+            text = a.get(field, "")
+            if text and not _has_chinese(text):
+                mappings.append((i, field))
+                texts.append(text[:300])
+
+    if not texts:
+        print("[INFO] 无需翻译")
+        return articles
+
+    print(f"[INFO] 翻译 {len(texts)} 段文本...")
+    for idx, text in enumerate(texts):
+        try:
+            result = _translator.translate(text)
+            art_idx, field = mappings[idx]
+            articles[art_idx][f"{field}_cn"] = result
+        except Exception as e:
+            print(f"[WARN] 翻译失败: {e}", file=sys.stderr)
+
+    return articles
+
+
+# ============================================================
+#  摘要生成
+# ============================================================
+
+def generate_digest(articles: list[dict]) -> str:
+    """用关键词加权算法从文章标题/摘要中提取 ≤600 字的中文摘要"""
+    texts = []
+    for a in articles:
+        title = a.get("title_cn") or a.get("title", "")
+        desc = a.get("desc_cn") or a.get("description", "")
+        if title:
+            texts.append(title)
+        if desc:
+            texts.append(desc)
+
+    full_text = "。".join(texts)
+    if not full_text.strip():
+        return "暂无昨日 AI 新闻摘要。"
+
+    # 按句号、感叹号、问号切分句子
+    sentences = [s.strip() for s in re.split(r"[。！？\n]+", full_text) if len(s.strip()) >= 6]
+    if not sentences:
+        sentences = [full_text[:MAX_DIGEST_CHARS]]
+
+    # 构建关键词词频表
+    keywords = ["AI", "人工智能", "大模型", "智能体", "Agent", "OpenAI", "ChatGPT", "GPT",
+                "LLM", "Claude", "Gemini", "机器学习", "深度学习", "生成式", "训练",
+                "发布", "开源", "融资", "模型", "数据", "应用", "推理", "多模态",
+                "人形机器人", "自动驾驶", "芯片", "算力"]
+    word_score: dict[str, int] = {}
+    for kw in keywords:
+        word_score[kw] = full_text.lower().count(kw.lower())
+
+    # 为每句打分：关键词出现次数 + 位置加分（标题靠前加分）
+    scored = []
+    for i, sent in enumerate(sentences):
+        score = sum(word_score.get(kw, 0) for kw in keywords
+                    if kw.lower() in sent.lower())
+        score += max(0, (len(sentences) - i) / len(sentences))  # 靠前加权
+        scored.append((score, sent))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # 按原文顺序取高分句直到接近 600 字
+    top_sentences = scored[:8]
+    top_sentences.sort(key=lambda x: sentences.index(x[1]))  # 恢复原文顺序
+
+    digest = ""
+    for _, sent in top_sentences:
+        if len(digest) + len(sent) + 1 <= MAX_DIGEST_CHARS:
+            digest += sent + "。"
+        else:
+            break
+
+    digest = digest.strip("。")
+    if len(digest) > MAX_DIGEST_CHARS:
+        digest = digest[:MAX_DIGEST_CHARS - 3] + "..."
+
+    return digest if digest else "暂无昨日 AI 新闻摘要。"
+
+
+# ============================================================
+#  新闻源实现
 # ============================================================
 
 def fetch_gnews() -> list[dict]:
-    """GNews API — 国际 AI 新闻（需要 GNEWS_API_KEY）"""
+    """GNews API — 国际 AI 新闻"""
     api_key = os.getenv("GNEWS_API_KEY", "")
     if not api_key:
         print("[SKIP] GNews: 未设置 GNEWS_API_KEY")
         return []
 
     terms = ["artificial intelligence", "large language model", "AI agent", "generative AI"]
-    results = []
-    seen = set()
-
+    results, seen = [], set()
     for term in terms:
         try:
             resp = requests.get(
@@ -129,24 +272,104 @@ def fetch_gnews() -> list[dict]:
                 if url and url not in seen:
                     seen.add(url)
                     results.append({
-                        "title": a.get("title", "无标题"),
+                        "title": a.get("title", ""),
                         "description": a.get("description", "") or "",
                         "url": url,
-                        "source": f"GNews · {a.get('source', {}).get('name', '')}",
+                        "source": f"GNews·{a.get('source', {}).get('name', '')}",
                         "published": a.get("publishedAt", ""),
                     })
         except Exception as e:
-            print(f"[WARN] GNews 搜索 '{term}' 失败: {e}", file=sys.stderr)
-
+            print(f"[WARN] GNews '{term}': {e}", file=sys.stderr)
     return results
 
 
-def fetch_hackernews() -> list[dict]:
-    """Hacker News — 搜索 AI 相关热门帖子（免费，无需 API Key）"""
-    terms = ["artificial intelligence", "LLM", "AI agent", "ChatGPT"]
-    results = []
-    seen = set()
+def fetch_bing() -> list[dict]:
+    """Bing News Search API — AI 新闻"""
+    api_key = os.getenv("BING_API_KEY", "")
+    if not api_key:
+        print("[SKIP] Bing: 未设置 BING_API_KEY（Azure 免费申请）")
+        return []
 
+    results = []
+    for query in ["AI artificial intelligence", "大模型 LLM", "AI agent"]:
+        try:
+            resp = requests.get(
+                "https://api.bing.microsoft.com/v7.0/news/search",
+                params={"q": query, "count": 10, "freshness": "Day", "mkt": "zh-CN"},
+                headers={"Ocp-Apim-Subscription-Key": api_key},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for a in resp.json().get("value", []):
+                results.append({
+                    "title": a.get("name", ""),
+                    "description": a.get("description", "") or "",
+                    "url": a.get("url", ""),
+                    "source": f"Bing·{a.get('provider', [{}])[0].get('name', '')}",
+                    "published": a.get("datePublished", ""),
+                })
+        except Exception as e:
+            print(f"[WARN] Bing '{query}': {e}", file=sys.stderr)
+    return results
+
+
+def fetch_baidu() -> list[dict]:
+    """百度新闻搜索 — AI 相关"""
+    results = []
+    queries = ["AI 人工智能", "大模型", "AI智能体", "OpenAI ChatGPT"]
+    for query in queries:
+        try:
+            resp = requests.get(
+                "https://news.baidu.com/ns",
+                params={"word": query, "pn": 0, "tn": "news"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                       "Chrome/120.0.0.0 Safari/537.36"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                continue
+
+            # 从 HTML 中提取标题/链接/摘要/时间
+            titles = re.findall(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', resp.text)
+            for url, title_raw in titles:
+                title = re.sub(r"<[^>]+>", "", title_raw).strip()
+                if not title or len(title) < 5:
+                    continue
+                # 提取摘要
+                desc_match = re.search(rf"{re.escape(title[:10])}.*?<span[^>]*>(.*?)</span>", resp.text, re.DOTALL)
+                desc = re.sub(r"<[^>]+>", "", desc_match.group(1)).strip() if desc_match else ""
+                # 提取时间
+                time_match = re.search(r"(\d+小时前|昨天|\d+分钟前|\d{1,2}月\d{1,2}日)", resp.text)
+                pub = time_match.group(1) if time_match else ""
+
+                results.append({
+                    "title": title,
+                    "description": desc[:200],
+                    "url": url,
+                    "source": "百度新闻",
+                    "published": pub,
+                })
+
+            if len(results) >= 10:
+                break
+        except Exception as e:
+            print(f"[WARN] 百度 '{query}': {e}", file=sys.stderr)
+
+    # 去重
+    seen = set()
+    unique = []
+    for r in results:
+        if r["url"] not in seen:
+            seen.add(r["url"])
+            unique.append(r)
+    return unique[:15]
+
+
+def fetch_hackernews() -> list[dict]:
+    """Hacker News — AI 相关热门帖子"""
+    terms = ["artificial intelligence", "LLM", "AI agent", "ChatGPT"]
+    results, seen = [], set()
     for term in terms:
         try:
             resp = requests.get(
@@ -160,31 +383,25 @@ def fetch_hackernews() -> list[dict]:
                 if url not in seen:
                     seen.add(url)
                     results.append({
-                        "title": hit.get("title", "无标题"),
+                        "title": hit.get("title", ""),
                         "description": f"{hit.get('points', 0)} 分 · {hit.get('num_comments', 0)} 评论",
                         "url": url,
                         "source": "Hacker News",
                         "published": hit.get("created_at", ""),
                     })
         except Exception as e:
-            print(f"[WARN] HackerNews 搜索 '{term}' 失败: {e}", file=sys.stderr)
-
+            print(f"[WARN] HN '{term}': {e}", file=sys.stderr)
     return results
 
 
 def fetch_36kr_ai() -> list[dict]:
-    """36氪 RSS — 国内科技新闻，按 AI 关键词过滤（免费）"""
+    """36氪 RSS — AI 关键词过滤"""
     try:
-        resp = requests.get(
-            "https://36kr.com/feed",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
+        resp = requests.get("https://36kr.com/feed",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.raise_for_status()
-
         ai_kw = ["AI", "人工智能", "大模型", "智能体", "ChatGPT", "GPT", "LLM",
                  "机器学习", "深度学习", "Agent", "OpenAI", "Claude", "Gemini"]
-
         results = []
         for a in _parse_feed(resp.text):
             if any(kw.lower() in a["title"].lower() for kw in ai_kw):
@@ -192,18 +409,15 @@ def fetch_36kr_ai() -> list[dict]:
                 results.append(a)
         return results[:15]
     except Exception as e:
-        print(f"[WARN] 36氪 RSS 获取失败: {e}", file=sys.stderr)
+        print(f"[WARN] 36氪: {e}", file=sys.stderr)
         return []
 
 
 def fetch_jiqizhixin() -> list[dict]:
-    """机器之心 RSS — AI 专业媒体（免费）"""
+    """机器之心 RSS"""
     try:
-        resp = requests.get(
-            "https://www.jiqizhixin.com/rss",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
+        resp = requests.get("https://www.jiqizhixin.com/rss",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.raise_for_status()
         results = []
         for a in _parse_feed(resp.text):
@@ -211,24 +425,19 @@ def fetch_jiqizhixin() -> list[dict]:
             results.append(a)
         return results[:15]
     except Exception as e:
-        print(f"[WARN] 机器之心 RSS 获取失败: {e}", file=sys.stderr)
+        print(f"[WARN] 机器之心: {e}", file=sys.stderr)
         return []
 
 
 def fetch_ithome() -> list[dict]:
-    """IT之家 RSS — 综合科技新闻，按 AI 关键词过滤（免费）"""
+    """IT之家 RSS — AI 关键词过滤"""
     try:
-        resp = requests.get(
-            "https://www.ithome.com/rss/",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
+        resp = requests.get("https://www.ithome.com/rss/",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.raise_for_status()
-
         ai_kw = ["AI", "人工智能", "大模型", "智能体", "ChatGPT", "GPT", "LLM",
                  "机器学习", "深度学习", "Agent", "OpenAI", "Claude", "Gemini",
                  "机器人", "自动驾驶", "芯片"]
-
         results = []
         for a in _parse_feed(resp.text):
             if any(kw.lower() in a["title"].lower() for kw in ai_kw):
@@ -236,18 +445,15 @@ def fetch_ithome() -> list[dict]:
                 results.append(a)
         return results[:15]
     except Exception as e:
-        print(f"[WARN] IT之家 RSS 获取失败: {e}", file=sys.stderr)
+        print(f"[WARN] IT之家: {e}", file=sys.stderr)
         return []
 
 
 def fetch_techcrunch_ai() -> list[dict]:
-    """TechCrunch AI 标签 RSS — 国际 AI 新闻（免费）"""
+    """TechCrunch AI RSS"""
     try:
-        resp = requests.get(
-            "https://techcrunch.com/tag/artificial-intelligence/feed/",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
+        resp = requests.get("https://techcrunch.com/tag/artificial-intelligence/feed/",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.raise_for_status()
         results = []
         for a in _parse_feed(resp.text):
@@ -255,100 +461,40 @@ def fetch_techcrunch_ai() -> list[dict]:
             results.append(a)
         return results[:15]
     except Exception as e:
-        print(f"[WARN] TechCrunch RSS 获取失败: {e}", file=sys.stderr)
+        print(f"[WARN] TechCrunch: {e}", file=sys.stderr)
         return []
 
 
 # ============================================================
-#  源注册表 — 添加新源在这里加一行就行
-#  (标识, 函数, 来源地区)
+#  源注册表
 # ============================================================
 SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
-    ("gnews",         fetch_gnews,         "🌍 国际"),
-    ("hackernews",    fetch_hackernews,    "🌍 国际"),
-    ("36kr_ai",       fetch_36kr_ai,       "🇨🇳 国内"),
-    ("jiqizhixin",    fetch_jiqizhixin,    "🇨🇳 国内"),
-    ("ithome",        fetch_ithome,        "🇨🇳 国内"),
-    ("techcrunch_ai", fetch_techcrunch_ai, "🌍 国际"),
+    ("gnews",        fetch_gnews,         "🌍 GNews"),
+    ("bing",         fetch_bing,          "🌍 Bing"),
+    ("baidu",        fetch_baidu,         "🇨🇳 百度"),
+    ("hackernews",   fetch_hackernews,    "🌍 HN"),
+    ("36kr_ai",      fetch_36kr_ai,       "🇨🇳 36氪"),
+    ("jiqizhixin",   fetch_jiqizhixin,    "🇨🇳 机器之心"),
+    ("ithome",       fetch_ithome,        "🇨🇳 IT之家"),
+    ("techcrunch_ai", fetch_techcrunch_ai, "🌍 TC"),
 ]
 
 
 # ============================================================
-#  翻译
+#  聚合、过滤、处理
 # ============================================================
 
-# 中文字符范围（含 CJK 统一汉字、中文标点）
-_CJK_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿　-〿＀-￯]+")
-
-_translator: GoogleTranslator | None = None
-
-
-def _needs_translation(text: str) -> bool:
-    """文本不含中文则可能需要翻译"""
-    return bool(text) and not bool(_CJK_RE.search(text))
-
-
-def translate_articles(articles: list[dict]) -> list[dict]:
-    """将英文标题和摘要翻译为中文，中文内容保持不变"""
-    global _translator
-    if _translator is None:
-        _translator = GoogleTranslator(source="en", target="zh-CN")
-
-    to_translate: list[tuple[int, str]] = []  # (index, text)
-    texts: list[str] = []
-
-    for i, a in enumerate(articles):
-        title = a.get("title", "")
-        desc = a.get("description", "")
-
-        need_title = _needs_translation(title)
-        need_desc = _needs_translation(desc)
-
-        if need_title:
-            to_translate.append((i, "title"))
-            texts.append(title)
-        if need_desc and desc:
-            to_translate.append((i, "desc"))
-            texts.append(desc[:300])
-
-    if not texts:
-        print("[INFO] 所有内容已是中文，无需翻译")
-        return articles
-
-    print(f"[INFO] 需要翻译 {len(texts)} 段文本...")
-
-    translated: dict[int, str] = {}  # text_index -> translated_text
-    for idx, text in enumerate(texts):
-        try:
-            result = _translator.translate(text)
-            translated[idx] = result
-            if (idx + 1) % 5 == 0:
-                print(f"       翻译进度: {idx + 1}/{len(texts)}")
-        except Exception as e:
-            print(f"[WARN] 翻译失败 (第{idx+1}条): {e}", file=sys.stderr)
-            translated[idx] = text  # 翻译失败保留原文
-
-    for (art_idx, field), (_, text) in zip(to_translate, enumerate(texts)):
-        if text in translated:  # 通过匹配原文找到翻译
-            pass  # translated[enumerate_index] already has the result
-
-    # 实际映射：to_translate 和 texts 的索引是对齐的
-    for trans_idx, (art_idx, field) in enumerate(to_translate):
-        if trans_idx in translated:
-            articles[art_idx][f"{field}_cn"] = translated[trans_idx]
-
-    return articles
-
 def collect_articles() -> list[dict]:
-    """遍历所有启用的源，收集并去重"""
-    all_articles: dict[str, dict] = {}  # url -> article
+    """遍历启用源，收集并去重"""
+    all_articles: dict[str, dict] = {}
+    yesterday = _get_yesterday()
 
-    for src_id, fetch_fn, region in SOURCES:
+    for src_id, fetch_fn, label in SOURCES:
         if SOURCE_SWITCH.get(src_id, "0") != "1":
-            print(f"[SKIP] {src_id} — 已禁用（设置 SOURCE_{src_id.upper()}=1 启用）")
+            print(f"[SKIP] {label} — 已禁用")
             continue
 
-        print(f"[FETCH] {region} {src_id}...")
+        print(f"[FETCH] {label}...")
         try:
             articles = fetch_fn()
             new_count = 0
@@ -359,73 +505,83 @@ def collect_articles() -> list[dict]:
                     new_count += 1
             print(f"       获取 {len(articles)} 条，新增 {new_count} 条")
         except Exception as e:
-            print(f"[ERROR] {src_id}: {e}", file=sys.stderr)
+            print(f"[ERROR] {label}: {e}", file=sys.stderr)
 
     result = list(all_articles.values())
     result.sort(key=lambda a: a.get("published", ""), reverse=True)
-    return result[:40]  # 最多 40 条
+    return result
 
 
-def build_html(articles: list[dict]) -> str:
-    """生成 HTML 邮件，有翻译则优先显示中文"""
+def filter_yesterday(articles: list[dict]) -> list[dict]:
+    """只保留昨天的文章"""
+    yesterday = _get_yesterday()
+    filtered = [a for a in articles if _is_yesterday(a.get("published", ""))]
+    print(f"[INFO] 日期过滤：{len(articles)} → {len(filtered)} 条（昨天 {yesterday}）")
+    return filtered[:30]
+
+
+# ============================================================
+#  邮件构建与发送
+# ============================================================
+
+def build_html(digest: str, articles: list[dict]) -> str:
+    """生成摘要邮件 HTML"""
     now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
-    rows = ""
-    for a in articles:
-        pub = a["published"].replace("T", " ").replace("Z", "")[:19] if a["published"] else ""
+    yesterday_str = _get_yesterday().strftime("%Y年%m月%d日")
 
-        # 标题：有中文翻译就显示中文，英文作为副标题
-        title_cn = a.get("title_cn", "")
-        title_en = a.get("title", "")
-        if title_cn and title_cn != title_en:
-            title_html = f'{title_cn}<br><span style="font-size:13px;color:#888;font-weight:normal">{title_en}</span>'
-        else:
-            title_html = title_en
+    # 来源链接列表（去重，最多 10 条）
+    seen_urls = set()
+    sources_html = ""
+    count = 0
+    for a in articles[:MAX_SOURCES]:
+        url = a.get("url", "")
+        title = a.get("title_cn") or a.get("title", "")
+        if url and url not in seen_urls and count < MAX_SOURCES:
+            seen_urls.add(url)
+            count += 1
+            source = a.get("source", "来源")
+            sources_html += f"""
+                <li style="margin:6px 0">
+                    <a href="{url}" style="color:#1a73e8">{title[:60]}</a>
+                    <span style="color:#999;font-size:12px"> — {source}</span>
+                </li>"""
 
-        # 摘要：优先中文
-        desc_cn = a.get("desc_cn", "")
-        desc_en = a.get("description", "")[:200]
-        if desc_cn and desc_cn != desc_en:
-            desc_html = f'{desc_cn}<br><span style="color:#999;font-size:12px">{desc_en[:150]}</span>'
-        elif desc_en:
-            desc_html = desc_en
-        else:
-            desc_html = ""
-
-        rows += f"""
-        <tr>
-            <td style="padding:12px;border-bottom:1px solid #eee">
-                <a href="{a['url']}" style="color:#1a73e8;text-decoration:none;font-weight:bold">{title_html}</a>
-                <div style="color:#555;font-size:14px;margin-top:4px">{desc_html}</div>
-                <div style="color:#999;font-size:12px;margin-top:4px">
-                    {pub} · <strong>{a['source']}</strong>
-                </div>
-            </td>
-        </tr>"""
+    # 字数统计
+    char_count = len(digest)
 
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
-<body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;background:#f5f5f5">
-    <div style="background:#1a73e8;color:#fff;padding:20px;text-align:center">
-        <h1 style="margin:0">🤖 每日 AI 新闻速递</h1>
-        <p style="margin:5px 0 0;font-size:14px;opacity:0.85">{now_str} 更新 · 共 {len(articles)} 条 · 多源聚合</p>
+<body style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:650px;margin:0 auto;background:#f5f5f5">
+    <div style="background:#1a73e8;color:#fff;padding:24px;text-align:center">
+        <h1 style="margin:0;font-size:22px">🤖 每日 AI 新闻摘要</h1>
+        <p style="margin:8px 0 0;font-size:14px;opacity:0.85">
+            {yesterday_str} · {now_str} 更新 · 共 {char_count} 字
+        </p>
     </div>
-    <div style="background:#fff;padding:10px 0">
-        <table style="width:100%;border-collapse:collapse">
-            {rows}
-        </table>
+
+    <div style="background:#fff;padding:20px 24px;margin:8px 0">
+        <h2 style="font-size:16px;color:#333;margin:0 0 12px">📋 昨日热点摘要</h2>
+        <p style="font-size:15px;line-height:1.8;color:#333;text-indent:2em">{digest}</p>
     </div>
+
+    <div style="background:#fff;padding:20px 24px;margin:8px 0">
+        <h2 style="font-size:16px;color:#333;margin:0 0 12px">🔗 参考来源</h2>
+        <ol style="padding-left:20px;font-size:14px">{sources_html}</ol>
+    </div>
+
     <div style="text-align:center;padding:15px;color:#999;font-size:12px">
-        由 GitHub Actions 自动发送 · GNews + HackerNews + 36氪 等来源聚合
+        由 GitHub Actions 每日自动发送 · 8 大新闻源聚合
     </div>
 </body>
 </html>"""
 
 
-def send_email(html: str, article_count: int):
-    """通过 QQ 邮箱 SMTP 发送"""
+def send_email(html: str):
+    """通过 QQ 邮箱发送"""
+    yesterday_str = _get_yesterday().strftime("%m月%d日")
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"每日 AI 新闻速递 · {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')}（{article_count}条）"
+    msg["Subject"] = f"AI 新闻日报 · {yesterday_str}"
     msg["From"] = QQ_EMAIL
     msg["To"] = QQ_EMAIL
     msg.attach(MIMEText(html, "html", "utf-8"))
@@ -434,23 +590,36 @@ def send_email(html: str, article_count: int):
         server.login(QQ_EMAIL, QQ_SMTP_CODE)
         server.sendmail(QQ_EMAIL, [QQ_EMAIL], msg.as_string())
 
-    print(f"[OK] 邮件发送成功，共 {article_count} 条新闻 → {QQ_EMAIL}")
+    print(f"[OK] 邮件发送成功 → {QQ_EMAIL}")
 
 
 def main():
     enabled_count = sum(1 for v in SOURCE_SWITCH.values() if v == "1")
-    print(f"[INFO] 已启用 {enabled_count}/{len(SOURCE_SWITCH)} 个新闻源，开始抓取...\n")
+    yesterday = _get_yesterday()
+    print(f"[INFO] 启用 {enabled_count}/{len(SOURCE_SWITCH)} 个源，目标日期：{yesterday}\n")
 
+    # 1. 收集
     articles = collect_articles()
-    print(f"\n[INFO] 去重后共 {len(articles)} 条新闻")
+    print(f"\n[INFO] 去重后共 {len(articles)} 条")
 
+    # 2. 过滤昨天
+    articles = filter_yesterday(articles)
     if not articles:
-        print("[WARN] 未获取到任何新闻，跳过发送", file=sys.stderr)
+        print("[WARN] 昨天无新闻，发送空报")
+        send_email(f"<p>{yesterday} 暂无 AI 相关新闻，明日再查看。</p>")
         return
 
+    # 3. 翻译
     articles = translate_articles(articles)
-    html = build_html(articles)
-    send_email(html, len(articles))
+
+    # 4. 生成摘要
+    print("[INFO] 生成摘要...")
+    digest = generate_digest(articles)
+    print(f"[INFO] 摘要字数：{len(digest)}")
+
+    # 5. 发送
+    html = build_html(digest, articles)
+    send_email(html)
 
 
 if __name__ == "__main__":
