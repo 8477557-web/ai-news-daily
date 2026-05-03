@@ -43,7 +43,8 @@ SOURCE_SWITCH = {
 }
 
 MAX_DIGEST_CHARS = 600
-MAX_SOURCES = 10
+MAX_REFERENCES = 50
+MIN_CLUSTER_KEYWORDS = 2  # 两篇文章共享 ≥2 个关键词则归为同一主题
 
 # ============================================================
 #  通用工具：RSS/Atom 解析、日期处理
@@ -187,64 +188,135 @@ def translate_articles(articles: list[dict]) -> list[dict]:
 
 
 # ============================================================
-#  摘要生成
+#  主题聚类 + 交叉验证 + 结论生成
 # ============================================================
 
-def generate_digest(articles: list[dict]) -> str:
-    """用关键词加权算法从文章标题/摘要中提取 ≤600 字的中文摘要"""
-    texts = []
+# 用于提取关键词的停用词（常见无意义词）
+_STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "in", "on",
+               "at", "to", "for", "of", "with", "and", "or", "but", "not", "this", "that",
+               "it", "its", "from", "by", "as", "has", "have", "had", "will", "would",
+               "can", "could", "may", "might", "new", "say", "says", "said", "how", "what",
+               "的", "了", "是", "在", "和", "也", "就", "都", "而", "及", "与", "着",
+               "或", "一个", "没有", "我们", "他们", "它们", "这个", "那个", "不", "会",
+               "可以", "已经", "还", "被", "把", "让", "更", "最", "所", "其", "等"}
+
+
+def _extract_keywords(text: str) -> set[str]:
+    """从文本中提取有意义的双字/三字关键词"""
+    # 中英文分别处理
+    words = set()
+    # 英文词（≥3字母）
+    for w in re.findall(r"[A-Za-z]{3,}", text):
+        wl = w.lower()
+        if wl not in _STOP_WORDS:
+            words.add(wl)
+    # 中文双字和三字组合
+    chinese = re.sub(r"[^一-鿿]+", "", text)
+    for i in range(len(chinese) - 1):
+        bigram = chinese[i:i+2]
+        if bigram not in _STOP_WORDS:
+            words.add(bigram)
+    for i in range(len(chinese) - 2):
+        trigram = chinese[i:i+3]
+        if trigram not in _STOP_WORDS:
+            words.add(trigram)
+    return words
+
+
+def cluster_by_topic(articles: list[dict]) -> list[dict]:
+    """主题聚类：将文章按共享关键词分组，同时统计跨源覆盖度"""
+    clusters: list[dict] = []  # [{topic_keywords, articles, sources, score}]
+
     for a in articles:
         title = a.get("title_cn") or a.get("title", "")
         desc = a.get("desc_cn") or a.get("description", "")
-        if title:
-            texts.append(title)
-        if desc:
-            texts.append(desc)
+        kw = _extract_keywords(f"{title} {desc}")
 
-    full_text = "。".join(texts)
-    if not full_text.strip():
-        return "暂无昨日 AI 新闻摘要。"
+        best_cluster = None
+        best_overlap = 0
+        for c in clusters:
+            overlap = len(kw & c["keywords"])
+            if overlap >= MIN_CLUSTER_KEYWORDS and overlap > best_overlap:
+                best_overlap = overlap
+                best_cluster = c
 
-    # 按句号、感叹号、问号切分句子
-    sentences = [s.strip() for s in re.split(r"[。！？\n]+", full_text) if len(s.strip()) >= 6]
-    if not sentences:
-        sentences = [full_text[:MAX_DIGEST_CHARS]]
-
-    # 构建关键词词频表
-    keywords = ["AI", "人工智能", "大模型", "智能体", "Agent", "OpenAI", "ChatGPT", "GPT",
-                "LLM", "Claude", "Gemini", "机器学习", "深度学习", "生成式", "训练",
-                "发布", "开源", "融资", "模型", "数据", "应用", "推理", "多模态",
-                "人形机器人", "自动驾驶", "芯片", "算力"]
-    word_score: dict[str, int] = {}
-    for kw in keywords:
-        word_score[kw] = full_text.lower().count(kw.lower())
-
-    # 为每句打分：关键词出现次数 + 位置加分（标题靠前加分）
-    scored = []
-    for i, sent in enumerate(sentences):
-        score = sum(word_score.get(kw, 0) for kw in keywords
-                    if kw.lower() in sent.lower())
-        score += max(0, (len(sentences) - i) / len(sentences))  # 靠前加权
-        scored.append((score, sent))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # 按原文顺序取高分句直到接近 600 字
-    top_sentences = scored[:8]
-    top_sentences.sort(key=lambda x: sentences.index(x[1]))  # 恢复原文顺序
-
-    digest = ""
-    for _, sent in top_sentences:
-        if len(digest) + len(sent) + 1 <= MAX_DIGEST_CHARS:
-            digest += sent + "。"
+        if best_cluster:
+            best_cluster["articles"].append(a)
+            best_cluster["keywords"] |= kw
         else:
+            clusters.append({
+                "keywords": kw,
+                "articles": [a],
+            })
+
+    # 为每个聚类计算跨源分数
+    for c in clusters:
+        sources = set(a.get("source", "") for a in c["articles"])
+        c["source_count"] = len(sources)
+        c["source_list"] = sorted(sources)
+        # 分数 = 文章数 × 不同来源数（多源验证加权）
+        c["score"] = len(c["articles"]) * len(sources)
+        # 提取主题标签（最高频的3个中文词）
+        all_text = " ".join(a.get("title_cn") or a.get("title", "") for a in c["articles"])
+        freq: dict[str, int] = {}
+        for w in _extract_keywords(all_text):
+            if len(w) >= 2:
+                freq[w] = freq.get(w, 0) + 1
+        c["top_terms"] = sorted(freq, key=freq.get, reverse=True)[:5]
+
+    clusters.sort(key=lambda c: c["score"], reverse=True)
+    return clusters
+
+
+def generate_conclusion(clusters: list[dict]) -> str:
+    """基于聚类结果生成 300-600 字结论，优先多源验证主题"""
+    if not clusters:
+        return "暂无昨日 AI 新闻。"
+
+    lines = []
+    char_count = 0
+    max_chars = MAX_DIGEST_CHARS
+
+    # 先处理多源验证的主题（source_count ≥ 2）
+    verified = [c for c in clusters if c["source_count"] >= 2]
+    single = [c for c in clusters if c["source_count"] == 1]
+
+    # 结论开头
+    yesterday = _get_yesterday().strftime("%m月%d日")
+    intro = f"昨日（{yesterday}）AI 领域热点集中在以下方向："
+    lines.append(intro)
+    char_count += len(intro)
+
+    for c in verified:
+        if char_count >= max_chars - 50:
             break
+        # 取前两篇文章标题作为主题描述
+        titles = [a.get("title_cn") or a.get("title", "") for a in c["articles"][:3]]
+        topic_desc = "、".join(titles[:2])[:80]
+        src_note = f"（{c['source_count']}个来源交叉验证）"
+        line = f"▸ {topic_desc}{src_note}"
+        if char_count + len(line) <= max_chars - 30:
+            lines.append(line)
+            char_count += len(line)
 
-    digest = digest.strip("。")
-    if len(digest) > MAX_DIGEST_CHARS:
-        digest = digest[:MAX_DIGEST_CHARS - 3] + "..."
+    # 单源消息简要提及
+    if single and char_count < max_chars - 100:
+        single_titles = []
+        for c in single[:5]:
+            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:40]
+            single_titles.append(t)
+        brief = "此外，" + "；".join(single_titles[:5])
+        if char_count + len(brief) <= max_chars:
+            lines.append(brief + "。")
+            char_count += len(brief) + 1
 
-    return digest if digest else "暂无昨日 AI 新闻摘要。"
+    # 结尾
+    total_sources = len(set(a.get("source", "") for c in clusters for a in c["articles"]))
+    footer = f"以上内容来自{len(clusters)}个主题、{total_sources}个独立来源。"
+    if char_count + len(footer) <= max_chars:
+        lines.append(footer)
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -511,61 +583,88 @@ def filter_yesterday(articles: list[dict]) -> list[dict]:
     yesterday = _get_yesterday()
     filtered = [a for a in articles if _is_yesterday(a.get("published", ""))]
     print(f"[INFO] 日期过滤：{len(articles)} → {len(filtered)} 条（昨天 {yesterday}）")
-    return filtered[:30]
+    return filtered[:MAX_REFERENCES]
 
 
 # ============================================================
 #  邮件构建与发送
 # ============================================================
 
-def build_html(digest: str, articles: list[dict]) -> str:
-    """生成摘要邮件 HTML"""
+def build_html(conclusion: str, clusters: list[dict]) -> str:
+    """生成邮件：结论摘要 + 按主题分组的参考来源"""
     now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     yesterday_str = _get_yesterday().strftime("%Y年%m月%d日")
 
-    # 来源链接列表（去重，最多 10 条）
-    seen_urls = set()
-    sources_html = ""
-    count = 0
-    for a in articles[:MAX_SOURCES]:
-        url = a.get("url", "")
-        title = a.get("title_cn") or a.get("title", "")
-        if url and url not in seen_urls and count < MAX_SOURCES:
-            seen_urls.add(url)
-            count += 1
-            source = a.get("source", "来源")
-            sources_html += f"""
-                <li style="margin:6px 0">
-                    <a href="{url}" style="color:#1a73e8">{title[:60]}</a>
-                    <span style="color:#999;font-size:12px"> — {source}</span>
-                </li>"""
+    # 统计
+    all_articles = [a for c in clusters for a in c["articles"]]
+    all_sources = set(a.get("source", "") for a in all_articles)
+    verified_count = sum(1 for c in clusters if c["source_count"] >= 2)
 
-    # 字数统计
-    char_count = len(digest)
+    # 按主题分组渲染来源链接
+    refs_html = ""
+    ref_count = 0
+    for ci, c in enumerate(clusters):
+        if ref_count >= MAX_REFERENCES:
+            break
+        # 主题标签
+        topic_label = " · ".join(c.get("top_terms", [])[:3])
+        badge = f"✅ {c['source_count']}源验证" if c["source_count"] >= 2 else f"📌 单源"
+        refs_html += f"""
+            <tr>
+                <td style="padding:8px 12px;background:#f0f7ff;font-weight:bold;color:#1a73e8;font-size:14px" colspan="2">
+                    {badge} — {topic_label}
+                </td>
+            </tr>"""
+
+        for a in c["articles"]:
+            if ref_count >= MAX_REFERENCES:
+                break
+            url = a.get("url", "")
+            title = (a.get("title_cn") or a.get("title", ""))[:60]
+            source = a.get("source", "")
+            if url and title:
+                ref_count += 1
+                refs_html += f"""
+            <tr>
+                <td style="padding:6px 12px;border-bottom:1px solid #f0f0f0;width:16px;text-align:center;color:#999;font-size:12px">{ref_count}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #f0f0f0;font-size:13px">
+                    <a href="{url}" style="color:#333;text-decoration:none">{title}</a>
+                    <span style="color:#999;font-size:11px"> — {source}</span>
+                </td>
+            </tr>"""
+
+    conclusion_html = conclusion.replace("\n", "<br>")
 
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
-<body style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:650px;margin:0 auto;background:#f5f5f5">
+<body style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:700px;margin:0 auto;background:#f5f5f5">
     <div style="background:#1a73e8;color:#fff;padding:24px;text-align:center">
-        <h1 style="margin:0;font-size:22px">🤖 每日 AI 新闻摘要</h1>
+        <h1 style="margin:0;font-size:22px">🤖 每日 AI 新闻日报</h1>
         <p style="margin:8px 0 0;font-size:14px;opacity:0.85">
-            {yesterday_str} · {now_str} 更新 · 共 {char_count} 字
+            {yesterday_str} · {now_str} 更新 · {len(clusters)}个主题 · {len(all_sources)}个来源
         </p>
     </div>
 
     <div style="background:#fff;padding:20px 24px;margin:8px 0">
-        <h2 style="font-size:16px;color:#333;margin:0 0 12px">📋 昨日热点摘要</h2>
-        <p style="font-size:15px;line-height:1.8;color:#333;text-indent:2em">{digest}</p>
+        <h2 style="font-size:16px;color:#333;margin:0 0 12px">
+            📋 今日结论
+            <span style="font-size:12px;color:#999;font-weight:normal">
+                （多源交叉验证：{verified_count}/{len(clusters)}个主题获跨源确认）
+            </span>
+        </h2>
+        <div style="font-size:15px;line-height:2;color:#333">{conclusion_html}</div>
     </div>
 
     <div style="background:#fff;padding:20px 24px;margin:8px 0">
-        <h2 style="font-size:16px;color:#333;margin:0 0 12px">🔗 参考来源</h2>
-        <ol style="padding-left:20px;font-size:14px">{sources_html}</ol>
+        <h2 style="font-size:16px;color:#333;margin:0 0 12px">🔗 参考来源（共 {ref_count} 条，按主题分组）</h2>
+        <table style="width:100%;border-collapse:collapse">
+            {refs_html}
+        </table>
     </div>
 
     <div style="text-align:center;padding:15px;color:#999;font-size:12px">
-        由 GitHub Actions 每日自动发送 · 8 大新闻源聚合
+        由 GitHub Actions 每日自动发送 · 8 大新闻源聚合 · 算法自动聚类
     </div>
 </body>
 </html>"""
@@ -606,13 +705,20 @@ def main():
     # 3. 翻译
     articles = translate_articles(articles)
 
-    # 4. 生成摘要
-    print("[INFO] 生成摘要...")
-    digest = generate_digest(articles)
-    print(f"[INFO] 摘要字数：{len(digest)}")
+    # 4. 主题聚类 + 结论生成
+    print("[INFO] 主题聚类...")
+    clusters = cluster_by_topic(articles)
+    print(f"[INFO] 聚类完成：{len(clusters)} 个主题")
+    for i, c in enumerate(clusters[:8]):
+        src_badge = f"✅{c['source_count']}源" if c["source_count"] >= 2 else "📌单源"
+        print(f"  {i+1}. [{src_badge}] {c.get('top_terms', [])[:3]} ({len(c['articles'])}篇)")
+
+    print("[INFO] 生成结论...")
+    conclusion = generate_conclusion(clusters)
+    print(f"[INFO] 结论字数：{len(conclusion)}")
 
     # 5. 发送
-    html = build_html(digest, articles)
+    html = build_html(conclusion, clusters)
     send_email(html)
 
 
