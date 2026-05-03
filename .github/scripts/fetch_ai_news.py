@@ -42,7 +42,8 @@ SOURCE_SWITCH = {
     "techcrunch_ai": os.getenv("SOURCE_TECHCRUNCH", "1"),
 }
 
-MAX_DIGEST_CHARS = 600
+MAX_DIGEST_CHARS = 1500
+MIN_DIGEST_CHARS = 1000
 MAX_REFERENCES = 50
 MIN_CLUSTER_KEYWORDS = 2  # 两篇文章共享 ≥2 个关键词则归为同一主题
 
@@ -269,54 +270,119 @@ def cluster_by_topic(articles: list[dict]) -> list[dict]:
 
 
 def generate_conclusion(clusters: list[dict]) -> str:
-    """基于聚类结果生成 300-600 字结论，优先多源验证主题"""
+    """基于聚类结果生成 ≥1000 字结论，详细分析每个主题"""
     if not clusters:
         return "暂无昨日 AI 新闻。"
 
     lines = []
     char_count = 0
-    max_chars = MAX_DIGEST_CHARS
 
-    # 先处理多源验证的主题（source_count ≥ 2）
     verified = [c for c in clusters if c["source_count"] >= 2]
     single = [c for c in clusters if c["source_count"] == 1]
 
-    # 结论开头
     yesterday = _get_yesterday().strftime("%m月%d日")
-    intro = f"昨日（{yesterday}）AI 领域热点集中在以下方向："
+
+    # ---- 开头概述 ----
+    total_articles = sum(len(c["articles"]) for c in clusters)
+    total_sources = len(set(a.get("source", "") for c in clusters for a in c["articles"]))
+    intro = (
+        f"昨日（{yesterday}），AI 领域共监测到 {len(clusters)} 个热点主题，"
+        f"涉及 {total_articles} 篇报道，来自 {total_sources} 个独立信息源。"
+        f"其中 {len(verified)} 个主题获得多源交叉验证，可信度较高。以下为详细分析："
+    )
     lines.append(intro)
     char_count += len(intro)
 
+    # ---- 详细分析每个多源验证主题 ----
+    section_num = 1
     for c in verified:
-        if char_count >= max_chars - 50:
+        if char_count > MAX_DIGEST_CHARS - 200:
             break
-        # 取前两篇文章标题作为主题描述
-        titles = [a.get("title_cn") or a.get("title", "") for a in c["articles"][:3]]
-        topic_desc = "、".join(titles[:2])[:80]
-        src_note = f"（{c['source_count']}个来源交叉验证）"
-        line = f"▸ {topic_desc}{src_note}"
-        if char_count + len(line) <= max_chars - 30:
-            lines.append(line)
-            char_count += len(line)
 
-    # 单源消息简要提及
-    if single and char_count < max_chars - 100:
-        single_titles = []
-        for c in single[:5]:
-            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:40]
-            single_titles.append(t)
-        brief = "此外，" + "；".join(single_titles[:5])
-        if char_count + len(brief) <= max_chars:
-            lines.append(brief + "。")
-            char_count += len(brief) + 1
+        terms = c.get("top_terms", [])[:3]
+        section_title = f"\n【{section_num}】{'·'.join(terms)}（{c['source_count']}个来源交叉验证，共{len(c['articles'])}篇报道）"
+        lines.append(section_title)
+        char_count += len(section_title)
+        section_num += 1
 
-    # 结尾
-    total_sources = len(set(a.get("source", "") for c in clusters for a in c["articles"]))
-    footer = f"以上内容来自{len(clusters)}个主题、{total_sources}个独立来源。"
-    if char_count + len(footer) <= max_chars:
+        # 提取该主题下的关键信息：每条报道的标题+摘要
+        details = []
+        for a in c["articles"][:5]:
+            title = a.get("title_cn") or a.get("title", "")
+            desc = a.get("desc_cn") or a.get("description", "")
+            src = a.get("source", "")
+            details.append(f"{title}（来源：{src}）")
+            if desc:
+                details.append(f"  → {desc[:150]}")
+
+        for d in details:
+            if char_count + len(d) + 2 < MAX_DIGEST_CHARS - 100:
+                lines.append(d)
+                char_count += len(d)
+            else:
+                break
+
+        # 该主题小结
+        if len(c["articles"]) >= 3:
+            summary = f"小结：该主题在{c['source_count']}个独立来源中均有报道，信息一致性较高，可确认事件真实性。"
+        elif len(c["articles"]) >= 2:
+            summary = f"小结：{c['source_count']}个来源共同关注此主题，建议进一步求证细节。"
+        else:
+            summary = ""
+        if summary and char_count + len(summary) < MAX_DIGEST_CHARS - 50:
+            lines.append(summary)
+            char_count += len(summary)
+
+    # ---- 单源消息 ----
+    if single and char_count < MAX_DIGEST_CHARS - 200:
+        lines.append(f"\n【其他关注】以下主题来自单一来源，仅供参考，建议进一步核实：")
+        char_count += 30
+        for i, c in enumerate(single[:8]):
+            if char_count > MAX_DIGEST_CHARS - 80:
+                break
+            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:80]
+            src = c["articles"][0].get("source", "")
+            item = f"  {i+1}. {t} ——{src}"
+            if char_count + len(item) < MAX_DIGEST_CHARS - 50:
+                lines.append(item)
+                char_count += len(item)
+
+    # ---- 综合评价结尾 ----
+    verified_count = len(verified)
+    if verified_count >= 5:
+        assessment = "综合评价：昨日AI新闻覆盖广泛，多个主题获得跨源验证，整体信息可靠性较高。"
+    elif verified_count >= 2:
+        assessment = "综合评价：昨日AI领域有数个值得关注的热点，部分主题仍需更多来源交叉确认。"
+    else:
+        assessment = "综合评价：昨日AI新闻较为分散，各来源独立报道为主，建议重点关注后续多源验证信息。"
+
+    footer = (
+        f"\n{assessment}"
+        f"本日报由算法自动生成，数据来自 {total_sources} 个来源，仅供参考，重要决策请核实原始报道。"
+    )
+    if char_count + len(footer) <= MAX_DIGEST_CHARS:
         lines.append(footer)
+        char_count += len(footer)
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+
+    # 确保不低于最低字数要求
+    if len(result) < MIN_DIGEST_CHARS:
+        # 补充更多单源详情
+        extra = []
+        for c in single[8:]:
+            if len(result) + len("\n".join(extra)) >= MIN_DIGEST_CHARS:
+                break
+            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:80]
+            src = c["articles"][0].get("source", "")
+            extra.append(f"  · {t} ——{src}")
+        if extra:
+            result += "\n\n补充关注：\n" + "\n".join(extra)
+
+    if len(result) > MAX_DIGEST_CHARS:
+        result = result[:MAX_DIGEST_CHARS - 3] + "..."
+
+    return result
 
 
 # ============================================================
