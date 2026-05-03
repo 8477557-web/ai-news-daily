@@ -1,0 +1,39 @@
+name: 每日 AI 新闻速递
+
+on:
+  schedule:
+    # 北京时间每天早上 8:00 (UTC 0:00)
+    - cron: "0 0 * * *"
+  workflow_dispatch:    # 支持手动触发
+
+jobs:
+  fetch-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 抓取新闻并发送邮件
+        env:
+          # === 必需 ===
+          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+          QQ_SMTP_CODE: ${{ secrets.QQ_SMTP_CODE }}
+          # === 新闻源开关（"1"=启用，"0"=禁用） ===
+          SOURCE_GNEWS: "1"
+          SOURCE_HACKERNEWS: "1"
+          SOURCE_36KR: "1"
+          SOURCE_JIQIZHIXIN: "1"
+          SOURCE_ITHOME: "1"
+          SOURCE_TECHCRUNCH: "1"
+        run: python .github/scripts/fetch_ai_news.py
