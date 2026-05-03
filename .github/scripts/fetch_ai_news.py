@@ -32,7 +32,7 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 # ---------- 新闻源开关 ----------
 SOURCE_SWITCH = {
     "gnews":        os.getenv("SOURCE_GNEWS", "1"),
-    "bing":         os.getenv("SOURCE_BING", "1"),
+    "brave":        os.getenv("SOURCE_BRAVE", "1"),
     "baidu":        os.getenv("SOURCE_BAIDU", "1"),
     "hackernews":   os.getenv("SOURCE_HACKERNEWS", "1"),
     "36kr_ai":      os.getenv("SOURCE_36KR", "1"),
@@ -283,33 +283,46 @@ def fetch_gnews() -> list[dict]:
     return results
 
 
-def fetch_bing() -> list[dict]:
-    """Bing News Search API — AI 新闻"""
-    api_key = os.getenv("BING_API_KEY", "")
+def fetch_brave() -> list[dict]:
+    """Brave Search API — 免费 2000 次/月，搜索 AI 新闻"""
+    api_key = os.getenv("BRAVE_API_KEY", "")
     if not api_key:
-        print("[SKIP] Bing: 未设置 BING_API_KEY（Azure 免费申请）")
+        print("[SKIP] Brave: 未设置 BRAVE_API_KEY（https://brave.com/search/api/ 免费申请）")
         return []
 
-    results = []
-    for query in ["AI artificial intelligence", "大模型 LLM", "AI agent"]:
+    results, seen = [], set()
+    for query in ["AI artificial intelligence latest", "大模型 AI 最新进展", "AI agent news"]:
         try:
             resp = requests.get(
-                "https://api.bing.microsoft.com/v7.0/news/search",
-                params={"q": query, "count": 10, "freshness": "Day", "mkt": "zh-CN"},
-                headers={"Ocp-Apim-Subscription-Key": api_key},
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "freshness": "pd", "count": 10, "search_lang": "zh"},
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": api_key,
+                },
                 timeout=15,
             )
             resp.raise_for_status()
-            for a in resp.json().get("value", []):
-                results.append({
-                    "title": a.get("name", ""),
-                    "description": a.get("description", "") or "",
-                    "url": a.get("url", ""),
-                    "source": f"Bing·{a.get('provider', [{}])[0].get('name', '')}",
-                    "published": a.get("datePublished", ""),
-                })
+            for r in resp.json().get("web", {}).get("results", []):
+                url = r.get("url", "")
+                if url and url not in seen:
+                    seen.add(url)
+                    # 解析发布时间
+                    pub = ""
+                    extra = r.get("extra_snippets", []) if "extra_snippets" in r else []
+                    for e in extra:
+                        if isinstance(e, str) and ("小时前" in e or "天前" in e or "月" in e):
+                            pub += e + " "
+                    results.append({
+                        "title": r.get("title", ""),
+                        "description": r.get("description", "") or "",
+                        "url": url,
+                        "source": "Brave Search",
+                        "published": pub.strip(),
+                    })
         except Exception as e:
-            print(f"[WARN] Bing '{query}': {e}", file=sys.stderr)
+            print(f"[WARN] Brave '{query}': {e}", file=sys.stderr)
     return results
 
 
@@ -470,7 +483,7 @@ def fetch_techcrunch_ai() -> list[dict]:
 # ============================================================
 SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
     ("gnews",        fetch_gnews,         "🌍 GNews"),
-    ("bing",         fetch_bing,          "🌍 Bing"),
+    ("brave",       fetch_brave,         "🌍 Brave"),
     ("baidu",        fetch_baidu,         "🇨🇳 百度"),
     ("hackernews",   fetch_hackernews,    "🌍 HN"),
     ("36kr_ai",      fetch_36kr_ai,       "🇨🇳 36氪"),

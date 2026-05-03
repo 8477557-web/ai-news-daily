@@ -30,10 +30,10 @@ jobs:
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_SMTP_CODE: ${{ secrets.QQ_SMTP_CODE }}
           # === 可选 ===
-          BING_API_KEY: ${{ secrets.BING_API_KEY }}
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
           # === 新闻源开关 ===
           SOURCE_GNEWS: "1"
-          SOURCE_BING: "1"
+          SOURCE_BRAVE: "1"
           SOURCE_BAIDU: "1"
           SOURCE_HACKERNEWS: "1"
           SOURCE_36KR: "1"
