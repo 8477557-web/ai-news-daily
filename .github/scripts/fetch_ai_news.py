@@ -1,17 +1,20 @@
-"""每日 AI 新闻摘要 — 多源聚合 + 中文翻译 + 智能摘要 + QQ 邮箱发送
+"""每日 AI 新闻摘要 — 多源聚合 + 中文翻译 + AI 智能摘要 + QQ 邮箱发送 + GitHub Pages 站点
 
 新闻源（可开关）：
-  API 类：GNews、Bing Search
-  免费 API：HackerNews
+  API 类：GNews
+  免费 API：HackerNews、DuckDuckGo
   RSS 类：36氪、机器之心、IT之家、TechCrunch
   网页抓取：百度新闻
+  社区：V2EX
 
-输出：昨日 AI 热点摘要（≤600字）+ 来源链接
+输出：AI 生成三板块简报 + Markdown 归档 + HTML 站点 + QQ 邮件
 """
 import os
 import re
 import sys
+import json
 import smtplib
+from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta, date
@@ -23,29 +26,44 @@ import xml.etree.ElementTree as ET
 from deep_translator import GoogleTranslator
 from duckduckgo_search import DDGS
 
+# ---------- 加载配置 ----------
+CONFIG_PATH = Path(__file__).with_name("config.json")
+
+def _load_config() -> dict:
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+CONFIG = _load_config()
+LLM_CONFIG = CONFIG.get("llm", {})
+OUTPUT_CONFIG = CONFIG.get("output", {})
+CLUSTER_CONFIG = CONFIG.get("clustering", {})
+DIGEST_CONFIG = CONFIG.get("digest", {})
+
 # ---------- 邮箱配置 ----------
-QQ_EMAIL = os.environ["QQ_EMAIL"]
-QQ_SMTP_CODE = os.environ["QQ_SMTP_CODE"]
+QQ_EMAIL = os.environ.get("QQ_EMAIL", "")
+QQ_SMTP_CODE = os.environ.get("QQ_SMTP_CODE", "")
 SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# ---------- 新闻源开关 ----------
-SOURCE_SWITCH = {
-    "gnews":        os.getenv("SOURCE_GNEWS", "1"),
-    "ddg":          os.getenv("SOURCE_DDG", "1"),
-    "baidu":        os.getenv("SOURCE_BAIDU", "1"),
-    "hackernews":   os.getenv("SOURCE_HACKERNEWS", "1"),
-    "36kr_ai":      os.getenv("SOURCE_36KR", "1"),
-    "jiqizhixin":   os.getenv("SOURCE_JIQIZHIXIN", "1"),
-    "ithome":       os.getenv("SOURCE_ITHOME", "1"),
-    "techcrunch_ai": os.getenv("SOURCE_TECHCRUNCH", "1"),
-}
+# ---------- 新闻源开关（环境变量优先，否则读 config.json） ----------
+def _src_enabled(src_id: str) -> str:
+    """返回 '1' 或 '0'，环境变量优先"""
+    env_key = f"SOURCE_{src_id.upper()}"
+    env_val = os.getenv(env_key)
+    if env_val is not None:
+        return env_val
+    cfg = CONFIG.get("sources", {}).get(src_id, {})
+    return "1" if cfg.get("enabled", True) else "0"
 
-MAX_DIGEST_CHARS = 1500
-MIN_DIGEST_CHARS = 1000
-MAX_REFERENCES = 50
-MIN_CLUSTER_KEYWORDS = 2  # 两篇文章共享 ≥2 个关键词则归为同一主题
+SOURCE_SWITCH = {src_id: _src_enabled(src_id) for src_id in [
+    "gnews", "ddg", "baidu", "hackernews", "36kr_ai", "jiqizhixin", "ithome", "techcrunch_ai", "v2ex"
+]}
+
+MAX_REFERENCES = CLUSTER_CONFIG.get("max_references", 50)
+MIN_CLUSTER_KEYWORDS = CLUSTER_CONFIG.get("min_cluster_keywords", 2)
 
 # ============================================================
 #  通用工具：RSS/Atom 解析、日期处理
@@ -269,120 +287,114 @@ def cluster_by_topic(articles: list[dict]) -> list[dict]:
     return clusters
 
 
-def generate_conclusion(clusters: list[dict]) -> str:
-    """基于聚类结果生成 ≥1000 字结论，详细分析每个主题"""
+def _build_digest_prompt(date_str: str, clusters: list[dict]) -> str:
+    """构建 AI 摘要 Prompt，输出三板块 Markdown 简报"""
+    min_items = DIGEST_CONFIG.get("min_items_per_section", 4)
+    max_items = DIGEST_CONFIG.get("max_items_per_section", 5)
+
+    # 将聚类结果格式化为素材文本
+    sections_text = []
+    for c in clusters:
+        for a in c["articles"]:
+            title = a.get("title_cn") or a.get("title", "")
+            url = a.get("url", "")
+            summary = (a.get("desc_cn") or a.get("description", ""))[:150]
+            source = a.get("source", "")
+            sections_text.append(f"- {title} ({source}) {url} | {summary}")
+
+    # 方括号转全角，防止 LLM 输出断裂
+    materials = "\n".join(sections_text).replace("[", "［").replace("]", "］")
+
+    return f"""请根据以下素材生成今日AI科技简报（用中文），必须严格输出 Markdown。
+
+日期：{date_str}
+
+输出格式要求：
+- 标题行：# AI News Daily | {date_str}
+- 先给 1 段导语（2-3 句）
+- 接着输出 3 个二级标题段落：
+  - ## 1. 今日必读：从全量素材中挑最重要/最值得关注的要点（偏"结果与影响"）
+  - ## 2. 趋势与解读：挑选能代表趋势的主题，给出简短解读（偏"为什么重要"）
+  - ## 3. 工具与深读：优先收录开源项目、开发工具、教程/长文（偏"怎么用/值得读什么"）
+- 每个段落包含 {min_items}-{max_items} 条要点，用无序列表
+- 每条要点格式：
+  - [标题文字](URL) (来源)
+    150字以内的内容总结
+- 标题文字里不要出现半角方括号 []
+- 链接必须是可点击的 Markdown 格式
+- 总结必须基于下方素材中的信息，严禁编造
+
+素材如下：
+{materials}
+"""
+
+
+def generate_ai_digest(clusters: list[dict]) -> str:
+    """调用 SiliconFlow API 生成三板块 Markdown 简报"""
+    if not clusters:
+        return "暂无昨日 AI 新闻。"
+
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from siliconflow_client import messages_create
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        print("[WARN] 未设置 DEEPSEEK_API_KEY，降级为规则生成", file=sys.stderr)
+        return _fallback_conclusion(clusters)
+
+    date_str = _get_yesterday().strftime("%Y-%m-%d")
+    prompt = _build_digest_prompt(date_str, clusters)
+
+    try:
+        result = messages_create(
+            api_key=api_key,
+            base_url=LLM_CONFIG.get("base_url", "https://api.siliconflow.cn/v1"),
+            model=LLM_CONFIG.get("model", "Pro/zai-org/GLM-5"),
+            system="你是一个专业的AI科技新闻编辑，擅长提炼要点和趋势分析。",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=LLM_CONFIG.get("max_tokens", 2500),
+            temperature=LLM_CONFIG.get("temperature", 0.6),
+            timeout=LLM_CONFIG.get("timeout_seconds", 120),
+            retries=LLM_CONFIG.get("retries", 3),
+        )
+        print(f"[INFO] AI 摘要生成成功，字数：{len(result)}")
+        return result
+    except Exception as e:
+        print(f"[WARN] AI 摘要生成失败: {e}，降级为规则生成", file=sys.stderr)
+        return _fallback_conclusion(clusters)
+
+
+def _fallback_conclusion(clusters: list[dict]) -> str:
+    """规则生成降级方案（AI 不可用时）"""
     if not clusters:
         return "暂无昨日 AI 新闻。"
 
     lines = []
-    char_count = 0
-
     verified = [c for c in clusters if c["source_count"] >= 2]
     single = [c for c in clusters if c["source_count"] == 1]
 
     yesterday = _get_yesterday().strftime("%m月%d日")
-
-    # ---- 开头概述 ----
     total_articles = sum(len(c["articles"]) for c in clusters)
     total_sources = len(set(a.get("source", "") for c in clusters for a in c["articles"]))
-    intro = (
-        f"昨日（{yesterday}），AI 领域共监测到 {len(clusters)} 个热点主题，"
-        f"涉及 {total_articles} 篇报道，来自 {total_sources} 个独立信息源。"
-        f"其中 {len(verified)} 个主题获得多源交叉验证，可信度较高。以下为详细分析："
-    )
-    lines.append(intro)
-    char_count += len(intro)
 
-    # ---- 详细分析每个多源验证主题 ----
-    section_num = 1
-    for c in verified:
-        if char_count > MAX_DIGEST_CHARS - 200:
-            break
+    lines.append(f"昨日（{yesterday}），AI 领域共监测到 {len(clusters)} 个热点主题，涉及 {total_articles} 篇报道，来自 {total_sources} 个独立信息源。")
 
+    for i, c in enumerate(verified[:8], 1):
         terms = c.get("top_terms", [])[:3]
-        section_title = f"\n【{section_num}】{'·'.join(terms)}（{c['source_count']}个来源交叉验证，共{len(c['articles'])}篇报道）"
-        lines.append(section_title)
-        char_count += len(section_title)
-        section_num += 1
-
-        # 提取该主题下的关键信息：每条报道的标题+摘要
-        details = []
-        for a in c["articles"][:5]:
+        lines.append(f"\n【{i}】{'·'.join(terms)}（{c['source_count']}个来源，{len(c['articles'])}篇）")
+        for a in c["articles"][:3]:
             title = a.get("title_cn") or a.get("title", "")
-            desc = a.get("desc_cn") or a.get("description", "")
             src = a.get("source", "")
-            details.append(f"{title}（来源：{src}）")
-            if desc:
-                details.append(f"  → {desc[:150]}")
+            lines.append(f"  - {title}（{src}）")
 
-        for d in details:
-            if char_count + len(d) + 2 < MAX_DIGEST_CHARS - 100:
-                lines.append(d)
-                char_count += len(d)
-            else:
-                break
+    if single:
+        lines.append(f"\n【其他关注】{len(single)} 个单源主题，仅供参考。")
+        for c in single[:5]:
+            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:60]
+            lines.append(f"  · {t}")
 
-        # 该主题小结
-        if len(c["articles"]) >= 3:
-            summary = f"小结：该主题在{c['source_count']}个独立来源中均有报道，信息一致性较高，可确认事件真实性。"
-        elif len(c["articles"]) >= 2:
-            summary = f"小结：{c['source_count']}个来源共同关注此主题，建议进一步求证细节。"
-        else:
-            summary = ""
-        if summary and char_count + len(summary) < MAX_DIGEST_CHARS - 50:
-            lines.append(summary)
-            char_count += len(summary)
-
-    # ---- 单源消息 ----
-    if single and char_count < MAX_DIGEST_CHARS - 200:
-        lines.append(f"\n【其他关注】以下主题来自单一来源，仅供参考，建议进一步核实：")
-        char_count += 30
-        for i, c in enumerate(single[:8]):
-            if char_count > MAX_DIGEST_CHARS - 80:
-                break
-            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:80]
-            src = c["articles"][0].get("source", "")
-            item = f"  {i+1}. {t} ——{src}"
-            if char_count + len(item) < MAX_DIGEST_CHARS - 50:
-                lines.append(item)
-                char_count += len(item)
-
-    # ---- 综合评价结尾 ----
-    verified_count = len(verified)
-    if verified_count >= 5:
-        assessment = "综合评价：昨日AI新闻覆盖广泛，多个主题获得跨源验证，整体信息可靠性较高。"
-    elif verified_count >= 2:
-        assessment = "综合评价：昨日AI领域有数个值得关注的热点，部分主题仍需更多来源交叉确认。"
-    else:
-        assessment = "综合评价：昨日AI新闻较为分散，各来源独立报道为主，建议重点关注后续多源验证信息。"
-
-    footer = (
-        f"\n{assessment}"
-        f"本日报由算法自动生成，数据来自 {total_sources} 个来源，仅供参考，重要决策请核实原始报道。"
-    )
-    if char_count + len(footer) <= MAX_DIGEST_CHARS:
-        lines.append(footer)
-        char_count += len(footer)
-
-    result = "\n".join(lines)
-
-    # 确保不低于最低字数要求
-    if len(result) < MIN_DIGEST_CHARS:
-        # 补充更多单源详情
-        extra = []
-        for c in single[8:]:
-            if len(result) + len("\n".join(extra)) >= MIN_DIGEST_CHARS:
-                break
-            t = (c["articles"][0].get("title_cn") or c["articles"][0].get("title", ""))[:80]
-            src = c["articles"][0].get("source", "")
-            extra.append(f"  · {t} ——{src}")
-        if extra:
-            result += "\n\n补充关注：\n" + "\n".join(extra)
-
-    if len(result) > MAX_DIGEST_CHARS:
-        result = result[:MAX_DIGEST_CHARS - 3] + "..."
-
-    return result
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -597,19 +609,69 @@ def fetch_techcrunch_ai() -> list[dict]:
         return []
 
 
+def fetch_v2ex() -> list[dict]:
+    """V2EX 热门话题 — AI 关键词过滤"""
+    v2ex_config = CONFIG.get("sources", {}).get("v2ex", {})
+    if not v2ex_config.get("enabled", True):
+        return []
+    url = v2ex_config.get("url", "https://www.v2ex.com/api/topics/hot.json")
+    limit = v2ex_config.get("limit", 20)
+    ai_kw = ["AI", "人工智能", "大模型", "LLM", "GPT", "ChatGPT", "OpenAI", "Claude",
+             "Gemini", "Agent", "智能体", "机器学习", "深度学习", "Copilot"]
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        results = []
+        for topic in resp.json()[:limit]:
+            title = topic.get("title", "")
+            if any(kw.lower() in title.lower() for kw in ai_kw):
+                results.append({
+                    "title": title,
+                    "description": (topic.get("content", "") or "")[:200],
+                    "url": topic.get("url", ""),
+                    "source": "V2EX",
+                    "published": topic.get("created", ""),
+                })
+        return results
+    except Exception as e:
+        print(f"[WARN] V2EX: {e}", file=sys.stderr)
+        return []
+
+
 # ============================================================
 #  源注册表
 # ============================================================
 SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
-    ("gnews",        fetch_gnews,         "🌍 GNews"),
-    ("ddg",         fetch_duckduckgo,    "🌍 DDG"),
-    ("baidu",        fetch_baidu,         "🇨🇳 百度"),
-    ("hackernews",   fetch_hackernews,    "🌍 HN"),
-    ("36kr_ai",      fetch_36kr_ai,       "🇨🇳 36氪"),
-    ("jiqizhixin",   fetch_jiqizhixin,    "🇨🇳 机器之心"),
-    ("ithome",       fetch_ithome,        "🇨🇳 IT之家"),
-    ("techcrunch_ai", fetch_techcrunch_ai, "🌍 TC"),
+    ("gnews",        fetch_gnews,         "GNews"),
+    ("ddg",          fetch_duckduckgo,    "DDG"),
+    ("baidu",        fetch_baidu,         "百度"),
+    ("hackernews",   fetch_hackernews,    "HN"),
+    ("36kr_ai",      fetch_36kr_ai,       "36氪"),
+    ("jiqizhixin",   fetch_jiqizhixin,    "机器之心"),
+    ("ithome",       fetch_ithome,        "IT之家"),
+    ("techcrunch_ai", fetch_techcrunch_ai, "TC"),
+    ("v2ex",         fetch_v2ex,          "V2EX"),
 ]
+
+
+# ============================================================
+#  归档保存
+# ============================================================
+
+def save_digest(date_str: str, markdown_text: str, sources_data: list[dict]):
+    """保存简报到 digests/ 目录"""
+    output_dir = Path(__file__).parent.parent.parent / OUTPUT_CONFIG.get("output_dir", "digests")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存 Markdown
+    (output_dir / f"{date_str}.md").write_text(markdown_text, encoding="utf-8")
+    # 保存 latest.md
+    (output_dir / "latest.md").write_text(markdown_text, encoding="utf-8")
+    # 保存来源数据
+    with (output_dir / f"{date_str}.sources.json").open("w", encoding="utf-8") as f:
+        json.dump(sources_data, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK] 已保存到 {output_dir}")
 
 
 # ============================================================
@@ -755,6 +817,7 @@ def send_email(html: str):
 def main():
     enabled_count = sum(1 for v in SOURCE_SWITCH.values() if v == "1")
     yesterday = _get_yesterday()
+    date_str = yesterday.strftime("%Y-%m-%d")
     print(f"[INFO] 启用 {enabled_count}/{len(SOURCE_SWITCH)} 个源，目标日期：{yesterday}\n")
 
     # 1. 收集
@@ -764,14 +827,15 @@ def main():
     # 2. 过滤昨天
     articles = filter_yesterday(articles)
     if not articles:
-        print("[WARN] 昨天无新闻，发送空报")
-        send_email(f"<p>{yesterday} 暂无 AI 相关新闻，明日再查看。</p>")
+        print("[WARN] 昨天无新闻")
+        if OUTPUT_CONFIG.get("send_email", True) and QQ_EMAIL:
+            send_email(f"<p>{yesterday} 暂无 AI 相关新闻，明日再查看。</p>")
         return
 
     # 3. 翻译
     articles = translate_articles(articles)
 
-    # 4. 主题聚类 + 结论生成
+    # 4. 主题聚类
     print("[INFO] 主题聚类...")
     clusters = cluster_by_topic(articles)
     print(f"[INFO] 聚类完成：{len(clusters)} 个主题")
@@ -779,13 +843,21 @@ def main():
         src_badge = f"✅{c['source_count']}源" if c["source_count"] >= 2 else "📌单源"
         print(f"  {i+1}. [{src_badge}] {c.get('top_terms', [])[:3]} ({len(c['articles'])}篇)")
 
-    print("[INFO] 生成结论...")
-    conclusion = generate_conclusion(clusters)
-    print(f"[INFO] 结论字数：{len(conclusion)}")
+    # 5. AI 摘要生成
+    print("[INFO] 生成 AI 摘要...")
+    digest_markdown = generate_ai_digest(clusters)
+    print(f"[INFO] 摘要字数：{len(digest_markdown)}")
 
-    # 5. 发送
-    html = build_html(conclusion, clusters)
-    send_email(html)
+    # 6. 归档保存
+    sources_data = [a for c in clusters for a in c["articles"]]
+    save_digest(date_str, digest_markdown, sources_data)
+
+    # 7. 发送邮件（可选）
+    if OUTPUT_CONFIG.get("send_email", True) and QQ_EMAIL:
+        html = build_html(digest_markdown, clusters)
+        send_email(html)
+    else:
+        print("[SKIP] 邮件发送已禁用或未配置")
 
 
 if __name__ == "__main__":

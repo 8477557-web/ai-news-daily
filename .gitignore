@@ -18,3 +18,7 @@ Thumbs.db
 config.json
 monitor_config.json
 .env
+
+# 站点分页文件（根目录，由 CI 生成）
+/page-*.html
+/index.html
