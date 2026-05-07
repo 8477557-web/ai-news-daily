@@ -27,7 +27,7 @@ from deep_translator import GoogleTranslator
 from duckduckgo_search import DDGS
 
 # ---------- 加载配置 ----------
-CONFIG_PATH = Path(__file__).with_name("config.json")
+CONFIG_PATH = Path(__file__).with_name("news_config.json")
 
 def _load_config() -> dict:
     if CONFIG_PATH.exists():

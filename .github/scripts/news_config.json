@@ -1,0 +1,37 @@
+{
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com",
+    "max_tokens": 2500,
+    "temperature": 0.6,
+    "timeout_seconds": 120,
+    "retries": 3
+  },
+  "sources": {
+    "gnews":        { "enabled": true, "api_key_env": "GNEWS_API_KEY" },
+    "ddg":          { "enabled": true },
+    "baidu":        { "enabled": true },
+    "hackernews":   { "enabled": true },
+    "36kr_ai":      { "enabled": true },
+    "jiqizhixin":   { "enabled": true },
+    "ithome":       { "enabled": true },
+    "techcrunch_ai": { "enabled": true },
+    "v2ex":         { "enabled": true, "url": "https://www.v2ex.com/api/topics/hot.json", "limit": 20 }
+  },
+  "clustering": {
+    "min_cluster_keywords": 2,
+    "max_references": 50
+  },
+  "digest": {
+    "language": "zh-CN",
+    "min_items_per_section": 4,
+    "max_items_per_section": 5
+  },
+  "output": {
+    "output_dir": "digests",
+    "timezone": "Asia/Shanghai",
+    "send_email": true,
+    "generate_site": true
+  }
+}
