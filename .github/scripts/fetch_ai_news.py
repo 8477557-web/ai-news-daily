@@ -20,11 +20,16 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta, date
 from typing import Callable
 
+import concurrent.futures
+import threading
 import requests
 import xml.etree.ElementTree as ET
 
 from deep_translator import GoogleTranslator
 from duckduckgo_search import DDGS
+
+# 确保同目录脚本可导入（siliconflow_client 等）
+sys.path.insert(0, str(Path(__file__).parent))
 
 # ---------- 加载配置 ----------
 CONFIG_PATH = Path(__file__).with_name("news_config.json")
@@ -59,8 +64,27 @@ def _src_enabled(src_id: str) -> str:
     return "1" if cfg.get("enabled", True) else "0"
 
 SOURCE_SWITCH = {src_id: _src_enabled(src_id) for src_id in [
-    "gnews", "ddg", "baidu", "hackernews", "36kr_ai", "jiqizhixin", "ithome", "techcrunch_ai", "v2ex"
+    "gnews", "ddg", "baidu", "hackernews", "36kr_ai", "jiqizhixin", "ithome", "techcrunch_ai", "v2ex",
+    "arxiv", "huggingface", "reddit_ml", "venturebeat", "mit_tr", "theverge_ai", "producthunt_ai", "weibo",
 ]}
+
+# 信源等级（T1=一手官方/学术，T1.5=官方社交/专业媒体，T2=KOL/综合媒体）
+SOURCE_TIER = {
+    "arxiv": "T1", "huggingface": "T1",
+    "jiqizhixin": "T1.5", "mit_tr": "T1.5", "weibo": "T1.5",
+    "gnews": "T2", "ddg": "T2", "baidu": "T2", "hackernews": "T2",
+    "36kr_ai": "T2", "ithome": "T2", "techcrunch_ai": "T2", "v2ex": "T2",
+    "reddit_ml": "T2", "venturebeat": "T2", "theverge_ai": "T2", "producthunt_ai": "T2",
+}
+
+# AI 预筛关键词（API 不可用时的降级方案）
+PRE_FILTER_KW = [
+    "AI", "artificial intelligence", "LLM", "large language model", "GPT", "ChatGPT",
+    "OpenAI", "Claude", "Anthropic", "Gemini", "DeepMind", "Stable Diffusion", "Midjourney",
+    "transformer", "diffusion model", "reinforcement learning", "RLHF", "fine-tuning",
+    "大模型", "人工智能", "机器学习", "深度学习", "智能体", "Agent", "AIGC",
+    "生成式", "神经网络", "NLP", "计算机视觉", "自动驾驶", "机器人",
+]
 
 MAX_REFERENCES = CLUSTER_CONFIG.get("max_references", 50)
 MIN_CLUSTER_KEYWORDS = CLUSTER_CONFIG.get("min_cluster_keywords", 2)
@@ -248,7 +272,7 @@ def cluster_by_topic(articles: list[dict]) -> list[dict]:
 
     for a in articles:
         title = a.get("title_cn") or a.get("title", "")
-        desc = a.get("desc_cn") or a.get("description", "")
+        desc = a.get("description_cn") or a.get("description", "")
         kw = _extract_keywords(f"{title} {desc}")
 
         best_cluster = None
@@ -298,7 +322,7 @@ def _build_digest_prompt(date_str: str, clusters: list[dict]) -> str:
         for a in c["articles"]:
             title = a.get("title_cn") or a.get("title", "")
             url = a.get("url", "")
-            summary = (a.get("desc_cn") or a.get("description", ""))[:150]
+            summary = (a.get("description_cn") or a.get("description", ""))[:150]
             source = a.get("source", "")
             sections_text.append(f"- {title} ({source}) {url} | {summary}")
 
@@ -334,8 +358,6 @@ def generate_ai_digest(clusters: list[dict]) -> str:
     if not clusters:
         return "暂无昨日 AI 新闻。"
 
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
     from siliconflow_client import messages_create
 
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -630,12 +652,209 @@ def fetch_v2ex() -> list[dict]:
                     "description": (topic.get("content", "") or "")[:200],
                     "url": topic.get("url", ""),
                     "source": "V2EX",
-                    "published": topic.get("created", ""),
+                    "published": str(topic.get("created", "")),
                 })
         return results
     except Exception as e:
         print(f"[WARN] V2EX: {e}", file=sys.stderr)
         return []
+
+
+def fetch_arxiv() -> list[dict]:
+    """ArXiv AI 论文（T1）— 免费 XML API，每日最新 AI 相关论文"""
+    results = []
+    # AI 相关分类：cs.AI, cs.CL, cs.CV, cs.LG, stat.ML
+    categories = ["cs.AI", "cs.CL", "cs.CV", "cs.LG"]
+    try:
+        for cat in categories:
+            resp = requests.get(
+                "http://export.arxiv.org/api/query",
+                params={"search_query": f"cat:{cat}", "sortBy": "submittedDate",
+                        "sortOrder": "descending", "max_results": 5},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                continue
+            root = ET.fromstring(resp.text)
+            ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+            for entry in root.findall("atom:entry", ns):
+                title = _find_text(entry, "title") or ""
+                summary = (_find_text(entry, "summary") or "")[:200]
+                url = ""
+                for link in entry.findall("atom:link", ns):
+                    if link.get("rel") == "alternate" or link.get("type") == "text/html":
+                        url = link.get("href", "")
+                        break
+                if not url:
+                    continue
+                published = _find_text(entry, "published") or ""
+                results.append({
+                    "title": title, "description": summary, "url": url,
+                    "source": f"ArXiv·{cat}", "source_tier": "T1",
+                    "published": published,
+                })
+    except Exception as e:
+        print(f"[WARN] ArXiv: {e}", file=sys.stderr)
+    return results
+
+
+def fetch_huggingface_papers() -> list[dict]:
+    """HuggingFace 每日论文（T1）— 免费 JSON API"""
+    results = []
+    try:
+        resp = requests.get(
+            "https://huggingface.co/api/daily_papers",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+        )
+        resp.raise_for_status()
+        for paper in resp.json()[:10]:
+            title = paper.get("title", "")
+            paper_id = paper.get("paper", {}).get("id", "") if isinstance(paper.get("paper"), dict) else ""
+            url = f"https://huggingface.co/papers/{paper_id}" if paper_id else ""
+            if not url:
+                url = paper.get("url", "")
+            results.append({
+                "title": title,
+                "description": (paper.get("summary", "") or paper.get("description", ""))[:200],
+                "url": url,
+                "source": "HuggingFace Papers", "source_tier": "T1",
+                "published": paper.get("publishedAt", ""),
+            })
+    except Exception as e:
+        print(f"[WARN] HuggingFace: {e}", file=sys.stderr)
+    return results
+
+
+def fetch_reddit_ml() -> list[dict]:
+    """Reddit r/MachineLearning 热门帖子（T2）— RSS 方式，无需 API Key"""
+    results = []
+    try:
+        resp = requests.get(
+            "https://www.reddit.com/r/MachineLearning/.rss",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AIHOT/1.0)"}, timeout=15,
+        )
+        if resp.status_code != 200:
+            # 回退到 old.reddit.com
+            resp = requests.get(
+                "https://old.reddit.com/r/MachineLearning/.rss",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+            )
+            resp.raise_for_status()
+        for a in _parse_feed(resp.text):
+            a["source"] = "Reddit ML"
+            a["source_tier"] = "T2"
+            results.append(a)
+        return results[:15]
+    except Exception as e:
+        print(f"[WARN] Reddit ML: {e}", file=sys.stderr)
+    return results
+
+
+def fetch_venturebeat_ai() -> list[dict]:
+    """VentureBeat AI 频道 RSS（T2）"""
+    try:
+        resp = requests.get("https://venturebeat.com/category/ai/feed/",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+        results = []
+        for a in _parse_feed(resp.text):
+            a["source"] = "VentureBeat"
+            a["source_tier"] = "T2"
+            results.append(a)
+        return results[:10]
+    except Exception as e:
+        print(f"[WARN] VentureBeat: {e}", file=sys.stderr)
+        return []
+
+
+def fetch_mit_tr() -> list[dict]:
+    """MIT Technology Review AI RSS（T1.5）"""
+    try:
+        resp = requests.get("https://www.technologyreview.com/feed/",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+        ai_kw = ["AI", "artificial intelligence", "machine learning", "robot",
+                 "deep learning", "neural", "LLM", "GPT"]
+        results = []
+        for a in _parse_feed(resp.text):
+            if any(kw.lower() in a["title"].lower() for kw in ai_kw):
+                a["source"] = "MIT Tech Review"
+                a["source_tier"] = "T1.5"
+                results.append(a)
+        return results[:10]
+    except Exception as e:
+        print(f"[WARN] MIT TR: {e}", file=sys.stderr)
+        return []
+
+
+def fetch_theverge_ai() -> list[dict]:
+    """The Verge 主 RSS — AI 关键词过滤（T2）"""
+    try:
+        resp = requests.get("https://www.theverge.com/rss/index.xml",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+        ai_kw = ["AI", "artificial intelligence", "OpenAI", "ChatGPT", "LLM",
+                 "Claude", "Gemini", "Microsoft AI", "Google AI", "Apple Intelligence",
+                 "robot", "machine learning"]
+        results = []
+        for a in _parse_feed(resp.text):
+            if any(kw.lower() in a["title"].lower() for kw in ai_kw):
+                a["source"] = "The Verge"
+                a["source_tier"] = "T2"
+                results.append(a)
+        return results[:10]
+    except Exception as e:
+        print(f"[WARN] The Verge: {e}", file=sys.stderr)
+        return []
+
+
+def fetch_producthunt_ai() -> list[dict]:
+    """ProductHunt AI 话题 RSS（T2）"""
+    try:
+        resp = requests.get("https://www.producthunt.com/feed?category=ai",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+        results = []
+        for a in _parse_feed(resp.text):
+            a["source"] = "ProductHunt AI"
+            a["source_tier"] = "T2"
+            results.append(a)
+        return results[:10]
+    except Exception as e:
+        print(f"[WARN] ProductHunt: {e}", file=sys.stderr)
+        return []
+
+
+def fetch_weibo_hot() -> list[dict]:
+    """微博热搜 AI 过滤（T1.5）— 免费 JSON API（需要中国大陆 IP）"""
+    results = []
+    try:
+        resp = requests.get(
+            "https://weibo.com/ajax/side/hotSearch",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://weibo.com/",
+            }, timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        hot_list = data.get("data", {}).get("realtime", [])
+        for item in hot_list[:30]:
+            title = item.get("word", "")
+            if any(kw.lower() in title.lower() for kw in PRE_FILTER_KW):
+                results.append({
+                    "title": title,
+                    "description": f"微博热搜 · 热度 {item.get('num', 0)}",
+                    "url": f"https://s.weibo.com/weibo?q={title}",
+                    "source": "微博热搜", "source_tier": "T1.5",
+                    "published": datetime.now(BEIJING_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                })
+    except Exception as e:
+        # GitHub Actions 境外 IP 可能被拦截，此为已知限制
+        print(f"[SKIP] 微博: 访问受限（可能需要中国大陆 IP）", file=sys.stderr)
+    return results
 
 
 # ============================================================
@@ -651,6 +870,14 @@ SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
     ("ithome",       fetch_ithome,        "IT之家"),
     ("techcrunch_ai", fetch_techcrunch_ai, "TC"),
     ("v2ex",         fetch_v2ex,          "V2EX"),
+    ("arxiv",        fetch_arxiv,         "ArXiv"),
+    ("huggingface",  fetch_huggingface_papers, "HF"),
+    ("reddit_ml",    fetch_reddit_ml,     "Reddit"),
+    ("venturebeat",  fetch_venturebeat_ai, "VB"),
+    ("mit_tr",       fetch_mit_tr,        "MIT-TR"),
+    ("theverge_ai",  fetch_theverge_ai,   "Verge"),
+    ("producthunt_ai", fetch_producthunt_ai, "PH"),
+    ("weibo",        fetch_weibo_hot,     "微博"),
 ]
 
 
@@ -658,8 +885,8 @@ SOURCES: list[tuple[str, Callable[[], list[dict]], str]] = [
 #  归档保存
 # ============================================================
 
-def save_digest(date_str: str, markdown_text: str, sources_data: list[dict]):
-    """保存简报到 digests/ 目录"""
+def save_digest(date_str: str, markdown_text: str, sources_data: list[dict], articles: list[dict]):
+    """保存简报到 digests/ 目录，同时输出 articles.json 用于时间线页面"""
     output_dir = Path(__file__).parent.parent.parent / OUTPUT_CONFIG.get("output_dir", "digests")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -671,6 +898,28 @@ def save_digest(date_str: str, markdown_text: str, sources_data: list[dict]):
     with (output_dir / f"{date_str}.sources.json").open("w", encoding="utf-8") as f:
         json.dump(sources_data, f, ensure_ascii=False, indent=2)
 
+    # 保存带评分的 articles.json（用于时间线页面）
+    timeline_articles = []
+    for a in articles:
+        item = {
+            "title": a.get("title", ""),
+            "title_cn": a.get("title_cn", ""),
+            "url": a.get("url", ""),
+            "source": a.get("source", ""),
+            "source_tier": a.get("source_tier", "T2"),
+            "score": a.get("score", 0),
+            "score_method": a.get("score_method", ""),
+            "published": a.get("published", ""),
+        }
+        desc = a.get("description_cn") or a.get("description", "")
+        if desc:
+            item["description"] = desc[:200]
+        timeline_articles.append(item)
+
+    with (output_dir / f"{date_str}.articles.json").open("w", encoding="utf-8") as f:
+        json.dump({"date": date_str, "total": len(timeline_articles),
+                    "articles": timeline_articles}, f, ensure_ascii=False, indent=2)
+
     print(f"[OK] 已保存到 {output_dir}")
 
 
@@ -679,31 +928,210 @@ def save_digest(date_str: str, markdown_text: str, sources_data: list[dict]):
 # ============================================================
 
 def collect_articles() -> list[dict]:
-    """遍历启用源，收集并去重"""
+    """线程池并行遍历启用源，收集并去重"""
     all_articles: dict[str, dict] = {}
-    yesterday = _get_yesterday()
+    lock = threading.Lock()
+    enabled = [(src_id, fn, label) for src_id, fn, label in SOURCES
+               if SOURCE_SWITCH.get(src_id, "0") == "1"]
 
-    for src_id, fetch_fn, label in SOURCES:
-        if SOURCE_SWITCH.get(src_id, "0") != "1":
-            print(f"[SKIP] {label} — 已禁用")
-            continue
-
-        print(f"[FETCH] {label}...")
+    def _fetch_one(src_id: str, fn: Callable[[], list[dict]], label: str):
         try:
-            articles = fetch_fn()
-            new_count = 0
+            articles = fn()
+            # 确保每条都有 source_tier
+            tier = SOURCE_TIER.get(src_id, "T2")
             for a in articles:
-                url = a.get("url", "")
-                if url and url not in all_articles:
-                    all_articles[url] = a
-                    new_count += 1
-            print(f"       获取 {len(articles)} 条，新增 {new_count} 条")
+                if "source_tier" not in a:
+                    a["source_tier"] = tier
+            return label, articles
         except Exception as e:
             print(f"[ERROR] {label}: {e}", file=sys.stderr)
+            return label, []
+
+    print(f"[INFO] 并行采集 {len(enabled)} 个源...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_fetch_one, s, f, l): l for s, f, l in enabled}
+        for future in concurrent.futures.as_completed(futures):
+            label, articles = future.result()
+            new_count = 0
+            with lock:
+                for a in articles:
+                    url = a.get("url", "")
+                    if url and url not in all_articles:
+                        all_articles[url] = a
+                        new_count += 1
+            print(f"  [{label}] 获取 {len(articles)} 条，新增 {new_count} 条")
 
     result = list(all_articles.values())
-    result.sort(key=lambda a: a.get("published", ""), reverse=True)
+    result.sort(key=lambda a: str(a.get("published", "")), reverse=True)
     return result
+
+
+# ============================================================
+#  AI 预筛 + 评分
+# ============================================================
+
+SCORING_CONFIG = CONFIG.get("scoring", {})
+PRE_FILTER_CONFIG = CONFIG.get("pre_filter", {})
+
+
+def pre_filter_ai_relevance(articles: list[dict]) -> list[dict]:
+    """使用 DeepSeek 批量判断文章是否与 AI 真正相关，不可用时回退到关键词过滤"""
+    if not articles:
+        return articles
+    if not PRE_FILTER_CONFIG.get("enabled", True):
+        return [a for a in articles if _keyword_filter(a)]
+
+    from siliconflow_client import messages_create
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        print("[WARN] 预筛: 无 DEEPSEEK_API_KEY，回退到关键词过滤")
+        return [a for a in articles if _keyword_filter(a)]
+
+    # 批量处理（每次 50 篇）
+    batch_size = 50
+    passed = []
+    for batch_start in range(0, len(articles), batch_size):
+        batch = articles[batch_start:batch_start + batch_size]
+        items = [f"{i+1}. {a.get('title', '')[:120]}" for i, a in enumerate(batch)]
+        prompt = f"""判断以下新闻标题是否与人工智能(AI)真正相关。注意：
+- 与AI、大模型、机器学习、深度学习、智能体直接相关 → 1
+- 仅仅是科技公司动态但与AI无关（如人事变动、财报）→ 0
+- 与AI间接相关（如AI政策、算力、数据中心、AI应用案例）→ 1
+- 完全不相关 → 0
+
+标题列表：
+{chr(10).join(items)}
+
+请返回 JSON 数组，格式：{{"results": [0, 1, 0, 1, ...]}}，长度必须为 {len(batch)}。只返回 JSON。"""
+
+        try:
+            result = messages_create(
+                api_key=api_key,
+                base_url=LLM_CONFIG.get("base_url", "https://api.deepseek.com"),
+                model=LLM_CONFIG.get("model", "deepseek-chat"),
+                system="你是AI新闻筛选器，只返回JSON。",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200, temperature=0.1,
+                timeout=LLM_CONFIG.get("timeout_seconds", 60),
+                retries=LLM_CONFIG.get("retries", 2),
+            )
+            match = re.search(r'\[[\d,\s]+\]', result)
+            if match:
+                scores = json.loads(match.group())
+                for a, s in zip(batch, scores):
+                    if int(s) == 1:
+                        a["relevance"] = "ai"
+                        passed.append(a)
+            else:
+                raise ValueError(f"无法解析预筛结果: {result[:100]}")
+        except Exception as e:
+            print(f"[WARN] 预筛 API 失败: {e}，该批回退到关键词过滤")
+            for a in batch:
+                if _keyword_filter(a):
+                    a["relevance"] = "keyword"
+                    passed.append(a)
+
+    print(f"[INFO] AI预筛: {len(articles)} → {len(passed)} 条")
+    return passed
+
+
+def _keyword_filter(article: dict) -> bool:
+    """关键词过滤降级方案"""
+    title = article.get("title", "").lower()
+    desc = article.get("description", "").lower()
+    text = f"{title} {desc}"
+    return any(kw.lower() in text for kw in PRE_FILTER_KW)
+
+
+def score_articles_simple(articles: list[dict]) -> list[dict]:
+    """用 DeepSeek 批量评分（1-10分），不可用时降级为规则评分"""
+    if not articles:
+        return articles
+    if not SCORING_CONFIG.get("enabled", True):
+        for a in articles:
+            a["score"] = _rule_score(a)
+        return articles
+
+    from siliconflow_client import messages_create
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        print("[WARN] 评分: 无 DEEPSEEK_API_KEY，回退到规则评分")
+        for a in articles:
+            a["score"] = _rule_score(a)
+        return articles
+
+    batch_size = 30
+    scored = []
+    for batch_start in range(0, len(articles), batch_size):
+        batch = articles[batch_start:batch_start + batch_size]
+        items = []
+        for i, a in enumerate(batch):
+            title = a.get("title_cn") or a.get("title", "")[:100]
+            src = a.get("source", "")
+            tier = a.get("source_tier", "T2")
+            items.append(f"{i+1}. [{tier}|{src}] {title}")
+
+        prompt = f"""作为AI新闻编辑，请为以下新闻的"值得关注程度"打分（1-10分，10=极其重要）。
+
+评分标准：
+- 8-10分：重大突破（如新模型发布、关键论文、重大产品更新）
+- 5-7分：值得一看（行业趋势、有趣发现、实用工具）
+- 1-4分：一般信息（营销软文、重复报道、边缘话题）
+
+新闻列表（共{len(batch)}条）：
+{chr(10).join(items)}
+
+请返回 JSON 数组：{{"scores": [8, 5, 3, ...]}}，长度必须为 {len(batch)}。只返回 JSON。"""
+
+        try:
+            result = messages_create(
+                api_key=api_key,
+                base_url=LLM_CONFIG.get("base_url", "https://api.deepseek.com"),
+                model=LLM_CONFIG.get("model", "deepseek-chat"),
+                system="你是AI新闻评分器，只返回JSON。",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200, temperature=0.2,
+                timeout=LLM_CONFIG.get("timeout_seconds", 60),
+                retries=LLM_CONFIG.get("retries", 2),
+            )
+            match = re.search(r'\[[\d,\s]+\]', result)
+            if match:
+                scores = json.loads(match.group())
+                for a, s in zip(batch, scores):
+                    a["score"] = int(s)
+                    a["score_method"] = "ai"
+                scored.extend(batch)
+            else:
+                raise ValueError(f"无法解析评分结果: {result[:100]}")
+        except Exception as e:
+            print(f"[WARN] 评分 API 失败: {e}，该批回退到规则评分")
+            for a in batch:
+                a["score"] = _rule_score(a)
+                a["score_method"] = "rule"
+            scored.extend(batch)
+
+    print(f"[INFO] 评分完成: {len(scored)} 条")
+    return scored
+
+
+def _rule_score(article: dict) -> int:
+    """规则评分降级方案（基于信源等级和多源验证）"""
+    tier_scores = {"T1": 6, "T1.5": 4, "T2": 2}
+    base = tier_scores.get(article.get("source_tier", "T2"), 2)
+    # 标题长度作为简单信号（太短可能信息量不足）
+    title_len = len(article.get("title", ""))
+    if title_len > 60:
+        base += 1
+    if title_len < 15:
+        base -= 1
+    # 有描述的加分
+    if article.get("description", ""):
+        base += 1
+    score = max(1, min(10, base))
+    article["score_method"] = "rule"
+    return score
 
 
 def filter_yesterday(articles: list[dict]) -> list[dict]:
@@ -820,11 +1248,11 @@ def main():
     date_str = yesterday.strftime("%Y-%m-%d")
     print(f"[INFO] 启用 {enabled_count}/{len(SOURCE_SWITCH)} 个源，目标日期：{yesterday}\n")
 
-    # 1. 收集
+    # 1. 并行采集
     articles = collect_articles()
     print(f"\n[INFO] 去重后共 {len(articles)} 条")
 
-    # 2. 过滤昨天
+    # 2. 日期过滤
     articles = filter_yesterday(articles)
     if not articles:
         print("[WARN] 昨天无新闻")
@@ -832,32 +1260,52 @@ def main():
             send_email(f"<p>{yesterday} 暂无 AI 相关新闻，明日再查看。</p>")
         return
 
-    # 3. 翻译
+    # 3. AI 预筛（判断是否真正AI相关）
+    print("[INFO] AI 预筛...")
+    articles = pre_filter_ai_relevance(articles)
+
+    # 4. 翻译
     articles = translate_articles(articles)
 
-    # 4. 主题聚类
+    # 5. AI 评分
+    print("[INFO] AI 评分...")
+    articles = score_articles_simple(articles)
+    # 按评分排序
+    articles.sort(key=lambda a: a.get("score", 0), reverse=True)
+
+    # 6. 主题聚类
     print("[INFO] 主题聚类...")
     clusters = cluster_by_topic(articles)
     print(f"[INFO] 聚类完成：{len(clusters)} 个主题")
     for i, c in enumerate(clusters[:8]):
-        src_badge = f"✅{c['source_count']}源" if c["source_count"] >= 2 else "📌单源"
-        print(f"  {i+1}. [{src_badge}] {c.get('top_terms', [])[:3]} ({len(c['articles'])}篇)")
+        src_badge = f"[{c['source_count']}源验证]" if c["source_count"] >= 2 else "[单源]"
+        print(f"  {i+1}. {src_badge} {c.get('top_terms', [])[:3]} ({len(c['articles'])}篇)")
 
-    # 5. AI 摘要生成
+    # 7. AI 摘要生成
     print("[INFO] 生成 AI 摘要...")
     digest_markdown = generate_ai_digest(clusters)
     print(f"[INFO] 摘要字数：{len(digest_markdown)}")
 
-    # 6. 归档保存
+    # 8. 归档保存（含 articles.json）
     sources_data = [a for c in clusters for a in c["articles"]]
-    save_digest(date_str, digest_markdown, sources_data)
+    save_digest(date_str, digest_markdown, sources_data, articles)
+    print(f"[INFO] 已评分文章: {len(articles)} 条, 平均分: {sum(a.get('score',0) for a in articles)/max(len(articles),1):.1f}")
 
-    # 7. 发送邮件（可选）
+    # 9. 发送邮件（可选）
     if OUTPUT_CONFIG.get("send_email", True) and QQ_EMAIL:
         html = build_html(digest_markdown, clusters)
         send_email(html)
     else:
         print("[SKIP] 邮件发送已禁用或未配置")
+
+    # 10. 输出评分 Top 10（预览）
+    min_show = SCORING_CONFIG.get("min_score_to_show", 3)
+    top = [a for a in articles if a.get("score", 0) >= min_show][:10]
+    if top:
+        print(f"\n[TOP] 评分 ≥{min_show} 的精选 ({len([a for a in articles if a.get('score',0)>=min_show])} 条中的前 10):")
+        for i, a in enumerate(top, 1):
+            title = (a.get("title_cn") or a.get("title", ""))[:60]
+            print(f"  {i}. [{a.get('score',0)}分|{a.get('source_tier','?')}|{a.get('source','')}] {title}")
 
 
 if __name__ == "__main__":
